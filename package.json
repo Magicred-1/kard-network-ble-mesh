@@ -1,6 +1,6 @@
 {
   "name": "kard-network-ble-mesh",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Kard Network BLE Mesh networking library for React Native with seamless permissions",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",
@@ -49,14 +49,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anthropics/kard-network-ble-mesh.git"
+    "url": "git+https://github.com/kard-network/kard-network-ble-mesh.git"
   },
-  "author": "Kard Network",
+  "author": {
+    "name": "rrigoni",
+    "email": "rrigoni@gmail.com"
+  },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/anthropics/kard-network-ble-mesh/issues"
+    "url": "https://github.com/kard-network/kard-network-ble-mesh/issues"
   },
-  "homepage": "https://github.com/anthropics/kard-network-ble-mesh#readme",
+  "homepage": "https://github.com/kard-network/kard-network-ble-mesh#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },
