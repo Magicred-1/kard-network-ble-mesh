@@ -1,3 +1,3 @@
 #!/bin/bash
-cd /Users/ronaldo/projects/kard/ble-mesh/library
+cd "$(dirname "$0")"
 npm publish --access public
