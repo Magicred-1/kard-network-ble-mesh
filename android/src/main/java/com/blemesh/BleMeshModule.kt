@@ -77,6 +77,16 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     private val fileTransferFragments = mutableMapOf<String, MutableMap<Int, ByteArray>>()
     private const val FILE_FRAGMENT_SIZE = 180 // Max payload size for fragments
 
+    // Transaction chunking tracking
+    private val pendingTransactionChunks = mutableMapOf<String, TransactionChunks>()
+    private data class TransactionChunks(
+        val txId: String,
+        val senderId: String,
+        val totalSize: Int,
+        val totalChunks: Int,
+        val chunks: MutableMap<Int, ByteArray> = mutableMapOf()
+    )
+
     // Coroutines
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -464,17 +474,27 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                     description = description
                 )
 
-                // Send as encrypted message to recipient
+                // Check if we need chunking (MTU limit is ~500 bytes for encrypted payload)
+                val maxPayloadSize = 450 // Conservative limit for encrypted data
+                
                 if (sessions.containsKey(recipientPeerId)) {
                     val encryptedPayload = byteArrayOf(NoisePayloadType.SOLANA_TRANSACTION.value) + payload
                     val encrypted = encryptPayload(encryptedPayload, recipientPeerId)
+                    
                     if (encrypted != null) {
-                        val packet = createPacket(
-                            type = MessageType.NOISE_ENCRYPTED.value,
-                            payload = encrypted,
-                            recipientId = hexStringToByteArray(recipientPeerId)
-                        )
-                        broadcastPacket(packet)
+                        if (encrypted.size <= maxPayloadSize) {
+                            // Small enough for single packet
+                            val packet = createPacket(
+                                type = MessageType.NOISE_ENCRYPTED.value,
+                                payload = encrypted,
+                                recipientId = hexStringToByteArray(recipientPeerId)
+                            )
+                            broadcastPacket(packet)
+                        } else {
+                            // Need to chunk large transaction
+                            Log.d(TAG, "Transaction too large (${encrypted.size} bytes), using chunking")
+                            sendChunkedTransaction(txId, encrypted, recipientPeerId)
+                        }
                     }
                 } else {
                     // No session, initiate handshake first
@@ -491,6 +511,110 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                 }
             }
         }
+    }
+
+    private suspend fun sendChunkedTransaction(txId: String, encryptedData: ByteArray, recipientPeerId: String) {
+        val chunkSize = 400 // Max chunk size for encrypted data
+        val totalChunks = (encryptedData.size + chunkSize - 1) / chunkSize
+        
+        Log.d(TAG, "Sending chunked transaction $txId: ${encryptedData.size} bytes in $totalChunks chunks")
+        
+        // Send metadata packet first
+        val metadataPayload = buildTransactionChunkMetadata(txId, encryptedData.size, totalChunks)
+        val metadataPacket = createPacket(
+            type = MessageType.SOLANA_TRANSACTION.value,
+            payload = metadataPayload,
+            recipientId = hexStringToByteArray(recipientPeerId)
+        )
+        broadcastPacket(metadataPacket)
+        
+        delay(100) // Give receiver time to prepare
+        
+        // Send chunks
+        for (chunkIndex in 0 until totalChunks) {
+            val start = chunkIndex * chunkSize
+            val end = minOf(start + chunkSize, encryptedData.size)
+            val chunkData = encryptedData.copyOfRange(start, end)
+            
+            val chunkPayload = buildTransactionChunk(txId, chunkIndex, totalChunks, chunkData)
+            val chunkPacket = createPacket(
+                type = MessageType.FRAGMENT.value,
+                payload = chunkPayload,
+                recipientId = hexStringToByteArray(recipientPeerId)
+            )
+            broadcastPacket(chunkPacket)
+            
+            Log.d(TAG, "Sent chunk ${chunkIndex + 1}/$totalChunks for transaction $txId")
+            delay(50) // Small delay between chunks
+        }
+    }
+
+    private fun buildTransactionChunkMetadata(txId: String, totalSize: Int, totalChunks: Int): ByteArray {
+        val stream = ByteArrayOutputStream()
+        
+        // Transaction ID TLV (tag 0x01)
+        val txIdBytes = txId.toByteArray(Charsets.UTF_8)
+        stream.write(0x01)
+        stream.write((txIdBytes.size shr 8) and 0xFF)
+        stream.write(txIdBytes.size and 0xFF)
+        stream.write(txIdBytes)
+        
+        // Total size TLV (tag 0x02) - 4 bytes
+        stream.write(0x02)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((totalSize shr 24) and 0xFF)
+        stream.write((totalSize shr 16) and 0xFF)
+        stream.write((totalSize shr 8) and 0xFF)
+        stream.write(totalSize and 0xFF)
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        stream.write(0x03)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((totalChunks shr 24) and 0xFF)
+        stream.write((totalChunks shr 16) and 0xFF)
+        stream.write((totalChunks shr 8) and 0xFF)
+        stream.write(totalChunks and 0xFF)
+        
+        return stream.toByteArray()
+    }
+
+    private fun buildTransactionChunk(txId: String, chunkIndex: Int, totalChunks: Int, chunkData: ByteArray): ByteArray {
+        val stream = ByteArrayOutputStream()
+        
+        // Transaction ID TLV (tag 0x01)
+        val txIdBytes = txId.toByteArray(Charsets.UTF_8)
+        stream.write(0x01)
+        stream.write((txIdBytes.size shr 8) and 0xFF)
+        stream.write(txIdBytes.size and 0xFF)
+        stream.write(txIdBytes)
+        
+        // Chunk index TLV (tag 0x02) - 4 bytes
+        stream.write(0x02)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((chunkIndex shr 24) and 0xFF)
+        stream.write((chunkIndex shr 16) and 0xFF)
+        stream.write((chunkIndex shr 8) and 0xFF)
+        stream.write(chunkIndex and 0xFF)
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        stream.write(0x03)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((totalChunks shr 24) and 0xFF)
+        stream.write((totalChunks shr 16) and 0xFF)
+        stream.write((totalChunks shr 8) and 0xFF)
+        stream.write(totalChunks and 0xFF)
+        
+        // Chunk data TLV (tag 0x04)
+        stream.write(0x04)
+        stream.write((chunkData.size shr 8) and 0xFF)
+        stream.write(chunkData.size and 0xFF)
+        stream.write(chunkData)
+        
+        return stream.toByteArray()
     }
 
     private fun buildSolanaTransactionPayload(
@@ -973,7 +1097,8 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             MessageType.NOISE_ENCRYPTED -> handleNoiseEncrypted(packet, senderId)
             MessageType.LEAVE -> handleLeave(senderId)
             MessageType.FILE_TRANSFER -> handleFileTransfer(packet, senderId)
-            MessageType.FRAGMENT -> handleFileFragment(packet, senderId)
+            MessageType.FRAGMENT -> handleFragment(packet, senderId)
+            MessageType.SOLANA_TRANSACTION -> handleTransactionMetadata(packet, senderId)
             else -> Log.d(TAG, "Unknown message type: ${packet.type}")
         }
 
@@ -1327,9 +1452,9 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         Log.d(TAG, "Started receiving file: $fileName ($fileSize bytes, $totalChunks chunks)")
     }
 
-    private fun handleFileFragment(packet: BitchatPacket, senderId: String) {
-        // Parse file fragment
-        var transferId: String? = null
+    private fun handleFragment(packet: BitchatPacket, senderId: String) {
+        // Parse fragment - could be file or transaction chunk
+        var id: String? = null
         var chunkIndex: Int? = null
         var totalChunks: Int? = null
         var chunkData: ByteArray? = null
@@ -1348,25 +1473,36 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             offset += length
 
             when (tag.toInt()) {
-                0x01 -> transferId = String(value, Charsets.UTF_8)
+                0x01 -> id = String(value, Charsets.UTF_8)
                 0x02 -> chunkIndex = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
                 0x03 -> totalChunks = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
                 0x04 -> chunkData = value
             }
         }
 
-        if (transferId == null || chunkIndex == null || totalChunks == null || chunkData == null) {
-            Log.e(TAG, "Invalid file fragment")
+        if (id == null || chunkIndex == null || totalChunks == null || chunkData == null) {
+            Log.e(TAG, "Invalid fragment")
             return
         }
 
+        // Check if this is a file fragment
+        if (activeFileTransfers.containsKey(id)) {
+            handleFileFragment(id, chunkIndex, totalChunks, chunkData)
+        } else if (pendingTransactionChunks.containsKey(id)) {
+            handleTransactionChunk(id, chunkIndex, totalChunks, chunkData)
+        } else {
+            Log.w(TAG, "Received fragment for unknown transfer/transaction: $id")
+        }
+    }
+
+    private fun handleFileFragment(transferId: String, chunkIndex: Int, totalChunks: Int, chunkData: ByteArray) {
         val transfer = activeFileTransfers[transferId] ?: return
         
         // Store the fragment
         fileTransferFragments[transferId]?.set(chunkIndex, chunkData)
         transfer.receivedChunks.add(chunkIndex)
 
-        Log.d(TAG, "Received chunk $chunkIndex/$totalChunks for transfer $transferId")
+        Log.d(TAG, "Received file chunk $chunkIndex/$totalChunks for transfer $transferId")
 
         // Check if we have all chunks
         if (transfer.receivedChunks.size == transfer.totalChunks) {
@@ -1400,6 +1536,82 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
 
             Log.d(TAG, "File transfer complete: ${transfer.fileName}")
         }
+    }
+
+    private fun handleTransactionChunk(txId: String, chunkIndex: Int, totalChunks: Int, chunkData: ByteArray) {
+        val pendingTx = pendingTransactionChunks[txId] ?: return
+        
+        // Store the chunk
+        pendingTx.chunks[chunkIndex] = chunkData
+
+        Log.d(TAG, "Received transaction chunk $chunkIndex/$totalChunks for tx $txId")
+
+        // Check if we have all chunks
+        if (pendingTx.chunks.size == pendingTx.totalChunks) {
+            // Reassemble encrypted data
+            val reassembledData = ByteArrayOutputStream()
+            for (i in 0 until pendingTx.totalChunks) {
+                pendingTx.chunks[i]?.let { reassembledData.write(it) }
+            }
+
+            // Decrypt and process
+            val sessionKey = sessions[pendingTx.senderId]
+            if (sessionKey != null) {
+                val decrypted = decryptPayload(reassembledData.toByteArray(), sessionKey)
+                if (decrypted != null && decrypted.isNotEmpty()) {
+                    // Skip the payload type byte and process as Solana transaction
+                    val payloadData = decrypted.copyOfRange(1, decrypted.size)
+                    handleSolanaTransaction(payloadData, pendingTx.senderId)
+                }
+            }
+
+            // Clean up
+            pendingTransactionChunks.remove(txId)
+
+            Log.d(TAG, "Transaction receive complete: $txId")
+        }
+    }
+
+    private fun handleTransactionMetadata(packet: BitchatPacket, senderId: String) {
+        // Parse transaction chunk metadata
+        var txId: String? = null
+        var totalSize: Int? = null
+        var totalChunks: Int? = null
+
+        var offset = 0
+        while (offset < packet.payload.size) {
+            if (offset + 3 > packet.payload.size) break
+
+            val tag = packet.payload[offset]
+            val length = ((packet.payload[offset + 1].toInt() and 0xFF) shl 8) or
+                    (packet.payload[offset + 2].toInt() and 0xFF)
+            offset += 3
+
+            if (offset + length > packet.payload.size) break
+            val value = packet.payload.copyOfRange(offset, offset + length)
+            offset += length
+
+            when (tag.toInt()) {
+                0x01 -> txId = String(value, Charsets.UTF_8)
+                0x02 -> totalSize = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+                0x03 -> totalChunks = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+            }
+        }
+
+        if (txId == null || totalSize == null || totalChunks == null) {
+            Log.e(TAG, "Invalid transaction metadata")
+            return
+        }
+
+        // Store pending transaction chunks info
+        pendingTransactionChunks[txId] = TransactionChunks(
+            txId = txId,
+            senderId = senderId,
+            totalSize = totalSize,
+            totalChunks = totalChunks
+        )
+
+        Log.d(TAG, "Started receiving chunked transaction: $txId ($totalSize bytes, $totalChunks chunks)")
     }
 
     private data class FileTransfer(

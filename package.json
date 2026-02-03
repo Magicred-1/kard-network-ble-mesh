@@ -1,6 +1,6 @@
 {
   "name": "kard-network-ble-mesh",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Kard Network BLE Mesh networking library for React Native with seamless permissions",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",

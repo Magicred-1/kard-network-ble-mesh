@@ -7,6 +7,8 @@ A React Native library for BLE (Bluetooth Low Energy) mesh networking. Build dec
 - **Cross-platform**: Works on both iOS and Android
 - **Mesh networking**: Messages automatically relay through peers
 - **End-to-end encryption**: Noise protocol for secure private messages
+- **File transfer**: Send files over BLE mesh (chunked for reliability)
+- **Solana transactions**: Multi-signature transaction signing over BLE
 - **Seamless permissions**: Handles permission requests automatically
 - **Message deduplication**: Built-in deduplication prevents duplicate messages
 - **Peer discovery**: Automatic discovery of nearby devices
@@ -145,6 +147,51 @@ Sends an encrypted private message to a specific peer. Returns the message ID.
 
 Sends a read receipt for a received message.
 
+##### `sendFile(filePath: string, options?: { recipientPeerId?: string; channel?: string }): Promise<string>`
+
+Sends a file over the mesh network. Files are automatically chunked for reliable transmission.
+
+```typescript
+// Send to all peers (broadcast)
+await BleMesh.sendFile('/path/to/photo.jpg');
+
+// Send to specific peer
+await BleMesh.sendFile('/path/to/document.pdf', { recipientPeerId: 'abc123' });
+```
+
+##### `sendTransaction(serializedTransaction: string, recipientPeerId: string, options): Promise<string>`
+
+Sends a Solana transaction for the recipient to sign as the second signer. Perfect for multi-signature transactions.
+
+```typescript
+// Send a partially signed transaction
+await BleMesh.sendTransaction(
+  base64SerializedTx,  // Transaction signed by first signer
+  recipientPeerId,
+  {
+    firstSignerPublicKey: senderPubKey,
+    secondSignerPublicKey: recipientPubKey,
+    description: 'Payment for services'
+  }
+);
+```
+
+##### `respondToTransaction(transactionId: string, recipientPeerId: string, response): Promise<void>`
+
+Responds to a received transaction with the signed transaction or an error.
+
+```typescript
+// Approve and sign
+await BleMesh.respondToTransaction(txId, senderPeerId, {
+  signedTransaction: fullySignedBase64Tx
+});
+
+// Reject
+await BleMesh.respondToTransaction(txId, senderPeerId, {
+  error: 'User rejected transaction'
+});
+```
+
 ##### `hasEncryptedSession(peerId: string): Promise<boolean>`
 
 Checks if an encrypted session exists with the specified peer.
@@ -199,9 +246,105 @@ Called when a read receipt is received.
 
 Called when a delivery acknowledgment is received.
 
+##### `onFileReceived(callback): () => void`
+
+Called when a file is received.
+
+```typescript
+BleMesh.onFileReceived(({ file }) => {
+  console.log('Received file:', file.fileName);
+  console.log('Size:', file.fileSize);
+  console.log('Data (base64):', file.data);
+  // Save or display the file...
+});
+```
+
+##### `onTransactionReceived(callback): () => void`
+
+Called when a Solana transaction is received for signing.
+
+```typescript
+BleMesh.onTransactionReceived(({ transaction }) => {
+  console.log('Transaction to sign:', transaction.id);
+  console.log('Serialized:', transaction.serializedTransaction);
+  console.log('First signer:', transaction.firstSignerPublicKey);
+  console.log('Second signer (you):', transaction.secondSignerPublicKey);
+  
+  // Sign with your wallet...
+  const signedTx = await yourWallet.signTransaction(transaction.serializedTransaction);
+  
+  // Respond
+  await BleMesh.respondToTransaction(transaction.id, transaction.senderPeerId, {
+    signedTransaction: signedTx
+  });
+});
+```
+
+##### `onTransactionResponse(callback): () => void`
+
+Called when a transaction response is received (signed or rejected).
+
+```typescript
+BleMesh.onTransactionResponse(({ response }) => {
+  if (response.signedTransaction) {
+    console.log('Transaction fully signed!');
+    // Broadcast to Solana network...
+  } else if (response.error) {
+    console.log('Transaction rejected:', response.error);
+  }
+});
+```
+
 ##### `onError(callback): () => void`
 
 Called when an error occurs.
+
+## Solana Multi-Signature Transaction Flow
+
+For 2-of-2 multi-signature transactions over BLE:
+
+```
+Alice (First Signer)                    Bob (Second Signer)
+     |                                        |
+     | 1. Create transaction                  |
+     | 2. Sign with Alice's key               |
+     | 3. Send via BleMesh.sendTransaction()  |
+     |--------------------------------------->|
+     |                                        |
+     |     4. onTransactionReceived event     |
+     |<---------------------------------------|
+     |                                        |
+     |     5. Review transaction              |
+     |     6. Sign with Bob's key             |
+     |<---------------------------------------|
+     |                                        |
+     | 7. respondToTransaction() with signed  |
+     |--------------------------------------->|
+     |                                        |
+     |     8. onTransactionResponse event     |
+     |<---------------------------------------|
+     |                                        |
+     | 9. Broadcast fully signed tx           |
+     |    to Solana network                   |
+     v                                        v
+```
+
+### MTU and Transaction Size Limits
+
+The library automatically handles BLE MTU limitations:
+
+| Feature | Max Size | Handling |
+|---------|----------|----------|
+| Simple messages | ~450 bytes | Single packet |
+| Small transactions | ~450 bytes | Single packet |
+| Large transactions | Unlimited | Automatic chunking (400 byte chunks) |
+| Files | Unlimited | Chunked (180 byte chunks) |
+
+**For Solana transactions:**
+- Most transactions (simple transfers) fit in a single packet
+- Complex transactions (multi-instruction, large memos) are automatically chunked
+- Chunking is transparent to the application layer
+- The receiver automatically reassembles chunks before decrypting
 
 ## Protocol Compatibility
 

@@ -65,6 +65,16 @@ class BleMesh: RCTEventEmitter {
     private var activeFileTransfers: [String: FileTransfer] = [:]
     private var fileTransferFragments: [String: [Int: Data]] = [:]
     private let fileFragmentSize = 180 // Max payload size for fragments
+    
+    // Transaction chunking tracking
+    private struct TransactionChunks {
+        let txId: String
+        let senderId: String
+        let totalSize: Int
+        let totalChunks: Int
+        var chunks: [Int: Data] = [:]
+    }
+    private var pendingTransactionChunks: [String: TransactionChunks] = [:]
 
     // Queues
     private let bleQueue = DispatchQueue(label: "mesh.bluetooth", qos: .userInitiated)
@@ -467,18 +477,28 @@ class BleMesh: RCTEventEmitter {
                 description: description
             )
             
+            // Check if we need chunking (MTU limit is ~500 bytes for encrypted payload)
+            let maxPayloadSize = 450 // Conservative limit
+            
             // Send as encrypted message to recipient
             if self.sessions[recipientPeerId] != nil {
                 var encryptedPayload = Data([NoisePayloadType.solanaTransaction.rawValue])
                 encryptedPayload.append(payload)
                 
                 if let encrypted = self.encryptPayload(encryptedPayload, for: recipientPeerId) {
-                    let packet = self.createPacket(
-                        type: MessageType.noiseEncrypted.rawValue,
-                        payload: encrypted,
-                        recipientID: Data(hexString: recipientPeerId)
-                    )
-                    self.broadcastPacket(packet)
+                    if encrypted.count <= maxPayloadSize {
+                        // Small enough for single packet
+                        let packet = self.createPacket(
+                            type: MessageType.noiseEncrypted.rawValue,
+                            payload: encrypted,
+                            recipientID: Data(hexString: recipientPeerId)
+                        )
+                        self.broadcastPacket(packet)
+                    } else {
+                        // Need to chunk large transaction
+                        print("Transaction too large (\(encrypted.count) bytes), using chunking")
+                        self.sendChunkedTransaction(txId: txId, encryptedData: encrypted, recipientPeerId: recipientPeerId)
+                    }
                 }
             } else {
                 // No session, initiate handshake first
@@ -489,6 +509,96 @@ class BleMesh: RCTEventEmitter {
                 resolve(txId)
             }
         }
+    }
+    
+    private func sendChunkedTransaction(txId: String, encryptedData: Data, recipientPeerId: String) {
+        let chunkSize = 400 // Max chunk size
+        let totalChunks = (encryptedData.count + chunkSize - 1) / chunkSize
+        
+        print("Sending chunked transaction \(txId): \(encryptedData.count) bytes in \(totalChunks) chunks")
+        
+        // Send metadata packet first
+        let metadataPayload = self.buildTransactionChunkMetadata(txId: txId, totalSize: encryptedData.count, totalChunks: totalChunks)
+        let metadataPacket = self.createPacket(
+            type: MessageType.solanaTransaction.rawValue,
+            payload: metadataPayload,
+            recipientID: Data(hexString: recipientPeerId)
+        )
+        self.broadcastPacket(metadataPacket)
+        
+        // Small delay to let receiver prepare
+        Thread.sleep(forTimeInterval: 0.1)
+        
+        // Send chunks
+        for chunkIndex in 0..<totalChunks {
+            let start = chunkIndex * chunkSize
+            let end = min(start + chunkSize, encryptedData.count)
+            let chunkData = encryptedData.subdata(in: start..<end)
+            
+            let chunkPayload = self.buildTransactionChunk(txId: txId, chunkIndex: chunkIndex, totalChunks: totalChunks, chunkData: chunkData)
+            let chunkPacket = self.createPacket(
+                type: MessageType.fragment.rawValue,
+                payload: chunkPayload,
+                recipientID: Data(hexString: recipientPeerId)
+            )
+            self.broadcastPacket(chunkPacket)
+            
+            print("Sent chunk \(chunkIndex + 1)/\(totalChunks) for transaction \(txId)")
+            Thread.sleep(forTimeInterval: 0.05) // Small delay between chunks
+        }
+    }
+    
+    private func buildTransactionChunkMetadata(txId: String, totalSize: Int, totalChunks: Int) -> Data {
+        var payload = Data()
+        
+        // Transaction ID TLV (tag 0x01)
+        let txIdData = Data(txId.utf8)
+        payload.append(0x01)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(txIdData.count).bigEndian) { Array($0) })
+        payload.append(txIdData)
+        
+        // Total size TLV (tag 0x02) - 4 bytes
+        payload.append(0x02)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(totalSize).bigEndian) { Array($0) })
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        payload.append(0x03)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(totalChunks).bigEndian) { Array($0) })
+        
+        return payload
+    }
+    
+    private func buildTransactionChunk(txId: String, chunkIndex: Int, totalChunks: Int, chunkData: Data) -> Data {
+        var payload = Data()
+        
+        // Transaction ID TLV (tag 0x01)
+        let txIdData = Data(txId.utf8)
+        payload.append(0x01)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(txIdData.count).bigEndian) { Array($0) })
+        payload.append(txIdData)
+        
+        // Chunk index TLV (tag 0x02) - 4 bytes
+        payload.append(0x02)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(chunkIndex).bigEndian) { Array($0) })
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        payload.append(0x03)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(totalChunks).bigEndian) { Array($0) })
+        
+        // Chunk data TLV (tag 0x04)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(chunkData.count).bigEndian) { Array($0) })
+        payload.append(chunkData)
+        
+        return payload
     }
     
     private func buildSolanaTransactionPayload(
@@ -768,7 +878,9 @@ class BleMesh: RCTEventEmitter {
         case .fileTransfer:
             handleFileTransfer(packet, from: senderID)
         case .fragment:
-            handleFileFragment(packet, from: senderID)
+            handleFragment(packet, from: senderID)
+        case .solanaTransaction:
+            handleTransactionMetadata(packet, from: senderID)
         default:
             break
         }
@@ -1219,9 +1331,9 @@ class BleMesh: RCTEventEmitter {
         print("Started receiving file: \(name) (\(size) bytes, \(chunks) chunks)")
     }
     
-    private func handleFileFragment(_ packet: BitchatPacket, from senderID: String) {
-        // Parse file fragment
-        var transferId: String?
+    private func handleFragment(_ packet: BitchatPacket, from senderID: String) {
+        // Parse fragment - could be file or transaction chunk
+        var id: String?
         var chunkIndex: Int?
         var totalChunks: Int?
         var chunkData: Data?
@@ -1240,7 +1352,7 @@ class BleMesh: RCTEventEmitter {
             
             switch tag {
             case 0x01:
-                transferId = String(data: value, encoding: .utf8)
+                id = String(data: value, encoding: .utf8)
             case 0x02 where value.count == 4:
                 chunkIndex = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
             case 0x03 where value.count == 4:
@@ -1252,19 +1364,30 @@ class BleMesh: RCTEventEmitter {
             }
         }
         
-        guard let id = transferId, let index = chunkIndex, let chunks = totalChunks, let data = chunkData else {
-            print("Invalid file fragment")
+        guard let fragmentId = id, let index = chunkIndex, let chunks = totalChunks, let data = chunkData else {
+            print("Invalid fragment")
             return
         }
         
+        // Check if this is a file fragment or transaction chunk
+        if activeFileTransfers[fragmentId] != nil {
+            handleFileFragment(id: fragmentId, chunkIndex: index, totalChunks: chunks, chunkData: data)
+        } else if pendingTransactionChunks[fragmentId] != nil {
+            handleTransactionChunk(id: fragmentId, chunkIndex: index, totalChunks: chunks, chunkData: data)
+        } else {
+            print("Received fragment for unknown transfer/transaction: \(fragmentId)")
+        }
+    }
+    
+    private func handleFileFragment(id: String, chunkIndex: Int, totalChunks: Int, chunkData: Data) {
         guard var transfer = activeFileTransfers[id] else { return }
         
         // Store the fragment
-        fileTransferFragments[id]?[index] = data
-        transfer.receivedChunks.insert(index)
+        fileTransferFragments[id]?[chunkIndex] = chunkData
+        transfer.receivedChunks.insert(chunkIndex)
         activeFileTransfers[id] = transfer
         
-        print("Received chunk \(index)/\(chunks) for transfer \(id)")
+        print("Received file chunk \(chunkIndex)/\(totalChunks) for transfer \(id)")
         
         // Check if we have all chunks
         if transfer.receivedChunks.count == transfer.totalChunks {
@@ -1298,6 +1421,88 @@ class BleMesh: RCTEventEmitter {
             
             print("File transfer complete: \(transfer.fileName)")
         }
+    }
+    
+    private func handleTransactionChunk(id: String, chunkIndex: Int, totalChunks: Int, chunkData: Data) {
+        guard var pendingTx = pendingTransactionChunks[id] else { return }
+        
+        // Store the chunk
+        pendingTx.chunks[chunkIndex] = chunkData
+        pendingTransactionChunks[id] = pendingTx
+        
+        print("Received transaction chunk \(chunkIndex)/\(totalChunks) for tx \(id)")
+        
+        // Check if we have all chunks
+        if pendingTx.chunks.count == pendingTx.totalChunks {
+            // Reassemble encrypted data
+            var reassembledData = Data()
+            for i in 0..<pendingTx.totalChunks {
+                if let chunk = pendingTx.chunks[i] {
+                    reassembledData.append(chunk)
+                }
+            }
+            
+            // Decrypt and process
+            if let sessionKey = sessions[pendingTx.senderId] {
+                if let decrypted = decryptPayload(reassembledData, with: sessionKey),
+                   decrypted.count > 0 {
+                    // Skip the payload type byte and process as Solana transaction
+                    let payloadData = decrypted.subdata(in: 1..<decrypted.count)
+                    handleSolanaTransaction(payloadData, from: pendingTx.senderId)
+                }
+            }
+            
+            // Clean up
+            pendingTransactionChunks.removeValue(forKey: id)
+            
+            print("Transaction receive complete: \(id)")
+        }
+    }
+    
+    private func handleTransactionMetadata(_ packet: BitchatPacket, from senderID: String) {
+        // Parse transaction chunk metadata
+        var txId: String?
+        var totalSize: Int?
+        var totalChunks: Int?
+        
+        var offset = 0
+        while offset < packet.payload.count {
+            guard offset + 3 <= packet.payload.count else { break }
+            
+            let tag = packet.payload[offset]
+            let length = Int(packet.payload[offset + 1]) << 8 | Int(packet.payload[offset + 2])
+            offset += 3
+            
+            guard offset + length <= packet.payload.count else { break }
+            let value = packet.payload.subdata(in: offset..<(offset + length))
+            offset += length
+            
+            switch tag {
+            case 0x01:
+                txId = String(data: value, encoding: .utf8)
+            case 0x02 where value.count == 4:
+                totalSize = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            case 0x03 where value.count == 4:
+                totalChunks = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            default:
+                break
+            }
+        }
+        
+        guard let id = txId, let size = totalSize, let chunks = totalChunks else {
+            print("Invalid transaction metadata")
+            return
+        }
+        
+        // Store pending transaction chunks info
+        pendingTransactionChunks[id] = TransactionChunks(
+            txId: id,
+            senderId: senderID,
+            totalSize: size,
+            totalChunks: chunks
+        )
+        
+        print("Started receiving chunked transaction: \(id) (\(size) bytes, \(chunks) chunks)")
     }
 }
 
