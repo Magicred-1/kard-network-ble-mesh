@@ -51,6 +51,20 @@ class BleMesh: RCTEventEmitter {
 
     // Message deduplication
     private var processedMessages: Set<String> = []
+    
+    // File transfer tracking
+    private struct FileTransfer {
+        let id: String
+        let fileName: String
+        let fileSize: Int
+        let mimeType: String
+        let senderPeerId: String
+        let totalChunks: Int
+        var receivedChunks: Set<Int> = []
+    }
+    private var activeFileTransfers: [String: FileTransfer] = [:]
+    private var fileTransferFragments: [String: [Int: Data]] = [:]
+    private let fileFragmentSize = 180 // Max payload size for fragments
 
     // Queues
     private let bleQueue = DispatchQueue(label: "mesh.bluetooth", qos: .userInitiated)
@@ -72,6 +86,8 @@ class BleMesh: RCTEventEmitter {
             "onPeerListUpdated",
             "onMessageReceived",
             "onFileReceived",
+            "onTransactionReceived",
+            "onTransactionResponse",
             "onConnectionStateChanged",
             "onReadReceipt",
             "onDeliveryAck",
@@ -311,10 +327,268 @@ class BleMesh: RCTEventEmitter {
         }
 
         let fileName = (filePath as NSString).lastPathComponent
-        let mimeType = getMimeType(for: filePath)
+        let mimeType = getMimeType(for: fileName)
+        let totalChunks = (fileData.count + fileFragmentSize - 1) / fileFragmentSize
 
-        // TODO: Implement file transfer
-        resolve(transferId)
+        messageQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Build and send metadata packet
+            let metadataPayload = self.buildFileTransferMetadata(
+                transferId: transferId,
+                fileName: fileName,
+                fileSize: fileData.count,
+                mimeType: mimeType,
+                totalChunks: totalChunks
+            )
+            
+            let metadataPacket = self.createPacket(
+                type: MessageType.fileTransfer.rawValue,
+                payload: metadataPayload,
+                recipientID: recipientPeerId != nil ? Data(hexString: recipientPeerId!) : nil
+            )
+            self.broadcastPacket(metadataPacket)
+            
+            // Send file fragments
+            for chunkIndex in 0..<totalChunks {
+                let start = chunkIndex * self.fileFragmentSize
+                let end = min(start + self.fileFragmentSize, fileData.count)
+                let chunkData = fileData.subdata(in: start..<end)
+                
+                let fragmentPayload = self.buildFileFragment(
+                    transferId: transferId,
+                    chunkIndex: chunkIndex,
+                    totalChunks: totalChunks,
+                    chunkData: chunkData
+                )
+                
+                let fragmentPacket = self.createPacket(
+                    type: MessageType.fragment.rawValue,
+                    payload: fragmentPayload,
+                    recipientID: recipientPeerId != nil ? Data(hexString: recipientPeerId!) : nil
+                )
+                self.broadcastPacket(fragmentPacket)
+                
+                // Small delay to avoid overwhelming the BLE stack
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            
+            DispatchQueue.main.async {
+                resolve(transferId)
+            }
+        }
+    }
+    
+    private func buildFileTransferMetadata(transferId: String, fileName: String, fileSize: Int, mimeType: String, totalChunks: Int) -> Data {
+        var payload = Data()
+        
+        // Transfer ID TLV (tag 0x01)
+        let transferIdData = Data(transferId.utf8)
+        payload.append(0x01)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(transferIdData.count).bigEndian) { Array($0) })
+        payload.append(transferIdData)
+        
+        // File name TLV (tag 0x02)
+        let fileNameData = Data(fileName.utf8)
+        payload.append(0x02)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(fileNameData.count).bigEndian) { Array($0) })
+        payload.append(fileNameData)
+        
+        // File size TLV (tag 0x03) - 4 bytes
+        payload.append(0x03)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(fileSize).bigEndian) { Array($0) })
+        
+        // MIME type TLV (tag 0x04)
+        let mimeTypeData = Data(mimeType.utf8)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(mimeTypeData.count).bigEndian) { Array($0) })
+        payload.append(mimeTypeData)
+        
+        // Total chunks TLV (tag 0x05) - 4 bytes
+        payload.append(0x05)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(totalChunks).bigEndian) { Array($0) })
+        
+        return payload
+    }
+    
+    private func buildFileFragment(transferId: String, chunkIndex: Int, totalChunks: Int, chunkData: Data) -> Data {
+        var payload = Data()
+        
+        // Transfer ID TLV (tag 0x01)
+        let transferIdData = Data(transferId.utf8)
+        payload.append(0x01)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(transferIdData.count).bigEndian) { Array($0) })
+        payload.append(transferIdData)
+        
+        // Chunk index TLV (tag 0x02) - 4 bytes
+        payload.append(0x02)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(chunkIndex).bigEndian) { Array($0) })
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        payload.append(0x03)
+        payload.append(0x00)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt32(totalChunks).bigEndian) { Array($0) })
+        
+        // Chunk data TLV (tag 0x04)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(chunkData.count).bigEndian) { Array($0) })
+        payload.append(chunkData)
+        
+        return payload
+    }
+    
+    @objc(sendTransaction:serializedTransaction:recipientPeerId:firstSignerPublicKey:secondSignerPublicKey:description:resolver:rejecter:)
+    func sendTransaction(
+        _ txId: String,
+        serializedTransaction: String,
+        recipientPeerId: String,
+        firstSignerPublicKey: String,
+        secondSignerPublicKey: String,
+        description: String?,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        messageQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Build TLV payload for Solana transaction
+            let payload = self.buildSolanaTransactionPayload(
+                txId: txId,
+                serializedTransaction: serializedTransaction,
+                firstSignerPublicKey: firstSignerPublicKey,
+                secondSignerPublicKey: secondSignerPublicKey,
+                description: description
+            )
+            
+            // Send as encrypted message to recipient
+            if self.sessions[recipientPeerId] != nil {
+                var encryptedPayload = Data([NoisePayloadType.solanaTransaction.rawValue])
+                encryptedPayload.append(payload)
+                
+                if let encrypted = self.encryptPayload(encryptedPayload, for: recipientPeerId) {
+                    let packet = self.createPacket(
+                        type: MessageType.noiseEncrypted.rawValue,
+                        payload: encrypted,
+                        recipientID: Data(hexString: recipientPeerId)
+                    )
+                    self.broadcastPacket(packet)
+                }
+            } else {
+                // No session, initiate handshake first
+                self.initiateHandshakeInternal(with: recipientPeerId)
+            }
+            
+            DispatchQueue.main.async {
+                resolve(txId)
+            }
+        }
+    }
+    
+    private func buildSolanaTransactionPayload(
+        txId: String,
+        serializedTransaction: String,
+        firstSignerPublicKey: String,
+        secondSignerPublicKey: String,
+        description: String?
+    ) -> Data {
+        var payload = Data()
+        
+        // Transaction ID TLV (tag 0x01)
+        let txIdData = Data(txId.utf8)
+        payload.append(0x01)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(txIdData.count).bigEndian) { Array($0) })
+        payload.append(txIdData)
+        
+        // Serialized transaction TLV (tag 0x02)
+        let txData = Data(serializedTransaction.utf8)
+        payload.append(0x02)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(txData.count).bigEndian) { Array($0) })
+        payload.append(txData)
+        
+        // First signer public key TLV (tag 0x03)
+        let firstSignerData = Data(firstSignerPublicKey.utf8)
+        payload.append(0x03)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(firstSignerData.count).bigEndian) { Array($0) })
+        payload.append(firstSignerData)
+        
+        // Second signer public key TLV (tag 0x04)
+        let secondSignerData = Data(secondSignerPublicKey.utf8)
+        payload.append(0x04)
+        payload.append(contentsOf: withUnsafeBytes(of: UInt16(secondSignerData.count).bigEndian) { Array($0) })
+        payload.append(secondSignerData)
+        
+        // Description TLV (tag 0x05) - optional
+        if let desc = description, !desc.isEmpty {
+            let descData = Data(desc.utf8)
+            payload.append(0x05)
+            payload.append(contentsOf: withUnsafeBytes(of: UInt16(descData.count).bigEndian) { Array($0) })
+            payload.append(descData)
+        }
+        
+        return payload
+    }
+    
+    @objc(respondToTransaction:recipientPeerId:signedTransaction:error:resolver:rejecter:)
+    func respondToTransaction(
+        _ transactionId: String,
+        recipientPeerId: String,
+        signedTransaction: String?,
+        error: String?,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        messageQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // Build TLV payload for response
+            var payload = Data()
+            
+            // Transaction ID TLV (tag 0x01)
+            let txIdData = Data(transactionId.utf8)
+            payload.append(0x01)
+            payload.append(contentsOf: withUnsafeBytes(of: UInt16(txIdData.count).bigEndian) { Array($0) })
+            payload.append(txIdData)
+            
+            // Signed transaction TLV (tag 0x02) - optional
+            if let signedTx = signedTransaction, !signedTx.isEmpty {
+                let signedTxData = Data(signedTx.utf8)
+                payload.append(0x02)
+                payload.append(contentsOf: withUnsafeBytes(of: UInt16(signedTxData.count).bigEndian) { Array($0) })
+                payload.append(signedTxData)
+            }
+            
+            // Error TLV (tag 0x03) - optional
+            if let err = error, !err.isEmpty {
+                let errData = Data(err.utf8)
+                payload.append(0x03)
+                payload.append(contentsOf: withUnsafeBytes(of: UInt16(errData.count).bigEndian) { Array($0) })
+                payload.append(errData)
+            }
+            
+            var encryptedPayload = Data([NoisePayloadType.transactionResponse.rawValue])
+            encryptedPayload.append(payload)
+            
+            // Send encrypted response
+            if let encrypted = self.encryptPayload(encryptedPayload, for: recipientPeerId) {
+                let packet = self.createPacket(
+                    type: MessageType.noiseEncrypted.rawValue,
+                    payload: encrypted,
+                    recipientID: Data(hexString: recipientPeerId)
+                )
+                self.broadcastPacket(packet)
+            }
+            
+            DispatchQueue.main.async {
+                resolve(nil)
+            }
+        }
     }
 
     @objc(sendReadReceipt:recipientPeerId:resolver:rejecter:)
@@ -491,6 +765,10 @@ class BleMesh: RCTEventEmitter {
             handleNoiseEncrypted(packet, from: senderID)
         case .leave:
             handleLeave(from: senderID)
+        case .fileTransfer:
+            handleFileTransfer(packet, from: senderID)
+        case .fragment:
+            handleFileFragment(packet, from: senderID)
         default:
             break
         }
@@ -642,6 +920,10 @@ class BleMesh: RCTEventEmitter {
             if let messageId = String(data: payloadData, encoding: .utf8) {
                 sendEvent(withName: "onDeliveryAck", body: ["messageId": messageId, "fromPeerId": senderID])
             }
+        case .solanaTransaction:
+            handleSolanaTransaction(Data(payloadData), from: senderID)
+        case .transactionResponse:
+            handleTransactionResponse(Data(payloadData), from: senderID)
         default:
             break
         }
@@ -686,6 +968,117 @@ class BleMesh: RCTEventEmitter {
         ]
 
         sendEvent(withName: "onMessageReceived", body: ["message": message])
+    }
+    
+    private func handleSolanaTransaction(_ data: Data, from senderID: String) {
+        // Parse TLV Solana transaction
+        var txId: String?
+        var serializedTransaction: String?
+        var firstSignerPublicKey: String?
+        var secondSignerPublicKey: String?
+        var description: String?
+        
+        var offset = 0
+        while offset < data.count {
+            guard offset + 3 <= data.count else { break }
+            
+            let tag = data[offset]
+            let length = Int(data[offset + 1]) << 8 | Int(data[offset + 2])
+            offset += 3
+            
+            guard offset + length <= data.count else { break }
+            let value = data.subdata(in: offset..<(offset + length))
+            offset += length
+            
+            switch tag {
+            case 0x01:
+                txId = String(data: value, encoding: .utf8)
+            case 0x02:
+                serializedTransaction = String(data: value, encoding: .utf8)
+            case 0x03:
+                firstSignerPublicKey = String(data: value, encoding: .utf8)
+            case 0x04:
+                secondSignerPublicKey = String(data: value, encoding: .utf8)
+            case 0x05:
+                description = String(data: value, encoding: .utf8)
+            default:
+                break
+            }
+        }
+        
+        guard let id = txId, let tx = serializedTransaction, let firstSigner = firstSignerPublicKey, let secondSigner = secondSignerPublicKey else {
+            print("Invalid Solana transaction data")
+            return
+        }
+        
+        var txDict: [String: Any] = [
+            "id": id,
+            "serializedTransaction": tx,
+            "senderPeerId": senderID,
+            "firstSignerPublicKey": firstSigner,
+            "secondSignerPublicKey": secondSigner,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+            "requiresSecondSigner": true
+        ]
+        
+        if let desc = description {
+            txDict["description"] = desc
+        }
+        
+        sendEvent(withName: "onTransactionReceived", body: ["transaction": txDict])
+        print("Received Solana transaction \(id) from \(senderID)")
+    }
+    
+    private func handleTransactionResponse(_ data: Data, from senderID: String) {
+        // Parse TLV transaction response
+        var txId: String?
+        var signedTransaction: String?
+        var error: String?
+        
+        var offset = 0
+        while offset < data.count {
+            guard offset + 3 <= data.count else { break }
+            
+            let tag = data[offset]
+            let length = Int(data[offset + 1]) << 8 | Int(data[offset + 2])
+            offset += 3
+            
+            guard offset + length <= data.count else { break }
+            let value = data.subdata(in: offset..<(offset + length))
+            offset += length
+            
+            switch tag {
+            case 0x01:
+                txId = String(data: value, encoding: .utf8)
+            case 0x02:
+                signedTransaction = String(data: value, encoding: .utf8)
+            case 0x03:
+                error = String(data: value, encoding: .utf8)
+            default:
+                break
+            }
+        }
+        
+        guard let id = txId else {
+            print("Invalid transaction response")
+            return
+        }
+        
+        var responseDict: [String: Any] = [
+            "id": id,
+            "responderPeerId": senderID,
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+        ]
+        
+        if let signedTx = signedTransaction {
+            responseDict["signedTransaction"] = signedTx
+        }
+        if let err = error {
+            responseDict["error"] = err
+        }
+        
+        sendEvent(withName: "onTransactionResponse", body: ["response": responseDict])
+        print("Received transaction response for \(id) from \(senderID)")
     }
 
     private func handleLeave(from senderID: String) {
@@ -756,15 +1149,154 @@ class BleMesh: RCTEventEmitter {
         sendEvent(withName: "onPeerListUpdated", body: ["peers": peerList])
     }
 
-    private func getMimeType(for path: String) -> String {
-        let ext = (path as NSString).pathExtension.lowercased()
+    private func getMimeType(for fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension.lowercased()
         switch ext {
         case "jpg", "jpeg": return "image/jpeg"
         case "png": return "image/png"
         case "gif": return "image/gif"
         case "pdf": return "application/pdf"
         case "txt": return "text/plain"
+        case "mp4": return "video/mp4"
+        case "mp3": return "audio/mpeg"
         default: return "application/octet-stream"
+        }
+    }
+    
+    private func handleFileTransfer(_ packet: BitchatPacket, from senderID: String) {
+        // Parse file transfer metadata
+        var transferId: String?
+        var fileName: String?
+        var fileSize: Int?
+        var mimeType: String?
+        var totalChunks: Int?
+        
+        var offset = 0
+        while offset < packet.payload.count {
+            guard offset + 3 <= packet.payload.count else { break }
+            
+            let tag = packet.payload[offset]
+            let length = Int(packet.payload[offset + 1]) << 8 | Int(packet.payload[offset + 2])
+            offset += 3
+            
+            guard offset + length <= packet.payload.count else { break }
+            let value = packet.payload.subdata(in: offset..<(offset + length))
+            offset += length
+            
+            switch tag {
+            case 0x01:
+                transferId = String(data: value, encoding: .utf8)
+            case 0x02:
+                fileName = String(data: value, encoding: .utf8)
+            case 0x03 where value.count == 4:
+                fileSize = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            case 0x04:
+                mimeType = String(data: value, encoding: .utf8)
+            case 0x05 where value.count == 4:
+                totalChunks = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            default:
+                break
+            }
+        }
+        
+        guard let id = transferId, let name = fileName, let size = fileSize, let mime = mimeType, let chunks = totalChunks else {
+            print("Invalid file transfer metadata")
+            return
+        }
+        
+        // Store transfer info
+        activeFileTransfers[id] = FileTransfer(
+            id: id,
+            fileName: name,
+            fileSize: size,
+            mimeType: mime,
+            senderPeerId: senderID,
+            totalChunks: chunks,
+            receivedChunks: []
+        )
+        fileTransferFragments[id] = [:]
+        
+        print("Started receiving file: \(name) (\(size) bytes, \(chunks) chunks)")
+    }
+    
+    private func handleFileFragment(_ packet: BitchatPacket, from senderID: String) {
+        // Parse file fragment
+        var transferId: String?
+        var chunkIndex: Int?
+        var totalChunks: Int?
+        var chunkData: Data?
+        
+        var offset = 0
+        while offset < packet.payload.count {
+            guard offset + 3 <= packet.payload.count else { break }
+            
+            let tag = packet.payload[offset]
+            let length = Int(packet.payload[offset + 1]) << 8 | Int(packet.payload[offset + 2])
+            offset += 3
+            
+            guard offset + length <= packet.payload.count else { break }
+            let value = packet.payload.subdata(in: offset..<(offset + length))
+            offset += length
+            
+            switch tag {
+            case 0x01:
+                transferId = String(data: value, encoding: .utf8)
+            case 0x02 where value.count == 4:
+                chunkIndex = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            case 0x03 where value.count == 4:
+                totalChunks = value.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            case 0x04:
+                chunkData = value
+            default:
+                break
+            }
+        }
+        
+        guard let id = transferId, let index = chunkIndex, let chunks = totalChunks, let data = chunkData else {
+            print("Invalid file fragment")
+            return
+        }
+        
+        guard var transfer = activeFileTransfers[id] else { return }
+        
+        // Store the fragment
+        fileTransferFragments[id]?[index] = data
+        transfer.receivedChunks.insert(index)
+        activeFileTransfers[id] = transfer
+        
+        print("Received chunk \(index)/\(chunks) for transfer \(id)")
+        
+        // Check if we have all chunks
+        if transfer.receivedChunks.count == transfer.totalChunks {
+            // Reassemble file
+            var reassembledData = Data()
+            for i in 0..<transfer.totalChunks {
+                if let chunk = fileTransferFragments[id]?[i] {
+                    reassembledData.append(chunk)
+                }
+            }
+            
+            // Convert to base64
+            let base64Data = reassembledData.base64EncodedString()
+            
+            // Emit file received event
+            let fileDict: [String: Any] = [
+                "id": transfer.id,
+                "fileName": transfer.fileName,
+                "fileSize": transfer.fileSize,
+                "mimeType": transfer.mimeType,
+                "data": base64Data,
+                "senderPeerId": transfer.senderPeerId,
+                "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+            ]
+            
+            sendEvent(withName: "onFileReceived", body: ["file": fileDict])
+            
+            // Clean up
+            activeFileTransfers.removeValue(forKey: id)
+            fileTransferFragments.removeValue(forKey: id)
+            
+            print("File transfer complete: \(transfer.fileName)")
         }
     }
 }
@@ -911,6 +1443,7 @@ enum MessageType: UInt8 {
     case fileTransfer = 0x06
     case fragment = 0x07
     case requestSync = 0x08
+    case solanaTransaction = 0x09
 }
 
 enum NoisePayloadType: UInt8 {
@@ -920,6 +1453,8 @@ enum NoisePayloadType: UInt8 {
     case fileTransfer = 0x04
     case verifyChallenge = 0x05
     case verifyResponse = 0x06
+    case solanaTransaction = 0x07
+    case transactionResponse = 0x08
 }
 
 struct BitchatPacket {

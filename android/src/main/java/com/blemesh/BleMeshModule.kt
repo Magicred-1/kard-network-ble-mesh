@@ -72,6 +72,11 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     // Message deduplication
     private val processedMessages = mutableSetOf<String>()
 
+    // File transfer tracking
+    private val activeFileTransfers = mutableMapOf<String, FileTransfer>()
+    private val fileTransferFragments = mutableMapOf<String, MutableMap<Int, ByteArray>>()
+    private const val FILE_FRAGMENT_SIZE = 180 // Max payload size for fragments
+
     // Coroutines
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -284,9 +289,320 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
 
     @ReactMethod
     fun sendFile(filePath: String, recipientPeerId: String?, channel: String?, promise: Promise) {
-        val transferId = UUID.randomUUID().toString()
-        // TODO: Implement file transfer
-        promise.resolve(transferId)
+        scope.launch {
+            try {
+                val transferId = UUID.randomUUID().toString()
+                val file = java.io.File(filePath)
+                
+                if (!file.exists()) {
+                    withContext(Dispatchers.Main) {
+                        promise.reject("FILE_ERROR", "File does not exist: $filePath")
+                    }
+                    return@launch
+                }
+
+                val fileData = file.readBytes()
+                val fileName = file.name
+                val mimeType = getMimeType(fileName)
+                val totalChunks = (fileData.size + FILE_FRAGMENT_SIZE - 1) / FILE_FRAGMENT_SIZE
+
+                // Build file transfer metadata packet
+                val metadataPayload = buildFileTransferMetadata(transferId, fileName, fileData.size, mimeType, totalChunks)
+                
+                val metadataPacket = createPacket(
+                    type = MessageType.FILE_TRANSFER.value,
+                    payload = metadataPayload,
+                    recipientId = recipientPeerId?.let { hexStringToByteArray(it) }
+                )
+                broadcastPacket(metadataPacket)
+
+                // Send file fragments
+                for (chunkIndex in 0 until totalChunks) {
+                    val start = chunkIndex * FILE_FRAGMENT_SIZE
+                    val end = minOf(start + FILE_FRAGMENT_SIZE, fileData.size)
+                    val chunkData = fileData.copyOfRange(start, end)
+                    
+                    val fragmentPayload = buildFileFragment(transferId, chunkIndex, totalChunks, chunkData)
+                    
+                    val fragmentPacket = createPacket(
+                        type = MessageType.FRAGMENT.value,
+                        payload = fragmentPayload,
+                        recipientId = recipientPeerId?.let { hexStringToByteArray(it) }
+                    )
+                    broadcastPacket(fragmentPacket)
+                    
+                    // Small delay to avoid overwhelming the BLE stack
+                    delay(50)
+                }
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(transferId)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send file: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    promise.reject("FILE_ERROR", e.message)
+                }
+            }
+        }
+    }
+
+    private fun buildFileTransferMetadata(transferId: String, fileName: String, fileSize: Int, mimeType: String, totalChunks: Int): ByteArray {
+        val stream = ByteArrayOutputStream()
+        
+        // Transfer ID TLV (tag 0x01)
+        val transferIdBytes = transferId.toByteArray(Charsets.UTF_8)
+        stream.write(0x01)
+        stream.write((transferIdBytes.size shr 8) and 0xFF)
+        stream.write(transferIdBytes.size and 0xFF)
+        stream.write(transferIdBytes)
+        
+        // File name TLV (tag 0x02)
+        val fileNameBytes = fileName.toByteArray(Charsets.UTF_8)
+        stream.write(0x02)
+        stream.write((fileNameBytes.size shr 8) and 0xFF)
+        stream.write(fileNameBytes.size and 0xFF)
+        stream.write(fileNameBytes)
+        
+        // File size TLV (tag 0x03) - 4 bytes
+        stream.write(0x03)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((fileSize shr 24) and 0xFF)
+        stream.write((fileSize shr 16) and 0xFF)
+        stream.write((fileSize shr 8) and 0xFF)
+        stream.write(fileSize and 0xFF)
+        
+        // MIME type TLV (tag 0x04)
+        val mimeTypeBytes = mimeType.toByteArray(Charsets.UTF_8)
+        stream.write(0x04)
+        stream.write((mimeTypeBytes.size shr 8) and 0xFF)
+        stream.write(mimeTypeBytes.size and 0xFF)
+        stream.write(mimeTypeBytes)
+        
+        // Total chunks TLV (tag 0x05) - 4 bytes
+        stream.write(0x05)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((totalChunks shr 24) and 0xFF)
+        stream.write((totalChunks shr 16) and 0xFF)
+        stream.write((totalChunks shr 8) and 0xFF)
+        stream.write(totalChunks and 0xFF)
+        
+        return stream.toByteArray()
+    }
+
+    private fun buildFileFragment(transferId: String, chunkIndex: Int, totalChunks: Int, chunkData: ByteArray): ByteArray {
+        val stream = ByteArrayOutputStream()
+        
+        // Transfer ID TLV (tag 0x01)
+        val transferIdBytes = transferId.toByteArray(Charsets.UTF_8)
+        stream.write(0x01)
+        stream.write((transferIdBytes.size shr 8) and 0xFF)
+        stream.write(transferIdBytes.size and 0xFF)
+        stream.write(transferIdBytes)
+        
+        // Chunk index TLV (tag 0x02) - 4 bytes
+        stream.write(0x02)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((chunkIndex shr 24) and 0xFF)
+        stream.write((chunkIndex shr 16) and 0xFF)
+        stream.write((chunkIndex shr 8) and 0xFF)
+        stream.write(chunkIndex and 0xFF)
+        
+        // Total chunks TLV (tag 0x03) - 4 bytes
+        stream.write(0x03)
+        stream.write(0x00)
+        stream.write(0x04)
+        stream.write((totalChunks shr 24) and 0xFF)
+        stream.write((totalChunks shr 16) and 0xFF)
+        stream.write((totalChunks shr 8) and 0xFF)
+        stream.write(totalChunks and 0xFF)
+        
+        // Chunk data TLV (tag 0x04)
+        stream.write(0x04)
+        stream.write((chunkData.size shr 8) and 0xFF)
+        stream.write(chunkData.size and 0xFF)
+        stream.write(chunkData)
+        
+        return stream.toByteArray()
+    }
+
+    private fun getMimeType(fileName: String): String {
+        val extension = fileName.substringAfterLast('.', "")
+        return when (extension.lowercase()) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "gif" -> "image/gif"
+            "pdf" -> "application/pdf"
+            "txt" -> "text/plain"
+            "mp4" -> "video/mp4"
+            "mp3" -> "audio/mpeg"
+            else -> "application/octet-stream"
+        }
+    }
+
+    @ReactMethod
+    fun sendTransaction(
+        txId: String,
+        serializedTransaction: String,
+        recipientPeerId: String,
+        firstSignerPublicKey: String,
+        secondSignerPublicKey: String,
+        description: String?,
+        promise: Promise
+    ) {
+        scope.launch {
+            try {
+                // Build TLV payload for Solana transaction
+                val payload = buildSolanaTransactionPayload(
+                    txId = txId,
+                    serializedTransaction = serializedTransaction,
+                    firstSignerPublicKey = firstSignerPublicKey,
+                    secondSignerPublicKey = secondSignerPublicKey,
+                    description = description
+                )
+
+                // Send as encrypted message to recipient
+                if (sessions.containsKey(recipientPeerId)) {
+                    val encryptedPayload = byteArrayOf(NoisePayloadType.SOLANA_TRANSACTION.value) + payload
+                    val encrypted = encryptPayload(encryptedPayload, recipientPeerId)
+                    if (encrypted != null) {
+                        val packet = createPacket(
+                            type = MessageType.NOISE_ENCRYPTED.value,
+                            payload = encrypted,
+                            recipientId = hexStringToByteArray(recipientPeerId)
+                        )
+                        broadcastPacket(packet)
+                    }
+                } else {
+                    // No session, initiate handshake first
+                    initiateHandshakeInternal(recipientPeerId)
+                }
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(txId)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send transaction: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    promise.reject("TRANSACTION_ERROR", e.message)
+                }
+            }
+        }
+    }
+
+    private fun buildSolanaTransactionPayload(
+        txId: String,
+        serializedTransaction: String,
+        firstSignerPublicKey: String,
+        secondSignerPublicKey: String,
+        description: String?
+    ): ByteArray {
+        val stream = ByteArrayOutputStream()
+
+        // Transaction ID TLV (tag 0x01)
+        val txIdBytes = txId.toByteArray(Charsets.UTF_8)
+        stream.write(0x01)
+        stream.write((txIdBytes.size shr 8) and 0xFF)
+        stream.write(txIdBytes.size and 0xFF)
+        stream.write(txIdBytes)
+
+        // Serialized transaction TLV (tag 0x02) - base64 encoded
+        val txBytes = serializedTransaction.toByteArray(Charsets.UTF_8)
+        stream.write(0x02)
+        stream.write((txBytes.size shr 8) and 0xFF)
+        stream.write(txBytes.size and 0xFF)
+        stream.write(txBytes)
+
+        // First signer public key TLV (tag 0x03)
+        val firstSignerBytes = firstSignerPublicKey.toByteArray(Charsets.UTF_8)
+        stream.write(0x03)
+        stream.write((firstSignerBytes.size shr 8) and 0xFF)
+        stream.write(firstSignerBytes.size and 0xFF)
+        stream.write(firstSignerBytes)
+
+        // Second signer public key TLV (tag 0x04)
+        val secondSignerBytes = secondSignerPublicKey.toByteArray(Charsets.UTF_8)
+        stream.write(0x04)
+        stream.write((secondSignerBytes.size shr 8) and 0xFF)
+        stream.write(secondSignerBytes.size and 0xFF)
+        stream.write(secondSignerBytes)
+
+        // Description TLV (tag 0x05) - optional
+        if (!description.isNullOrEmpty()) {
+            val descBytes = description.toByteArray(Charsets.UTF_8)
+            stream.write(0x05)
+            stream.write((descBytes.size shr 8) and 0xFF)
+            stream.write(descBytes.size and 0xFF)
+            stream.write(descBytes)
+        }
+
+        return stream.toByteArray()
+    }
+
+    @ReactMethod
+    fun respondToTransaction(
+        transactionId: String,
+        recipientPeerId: String,
+        signedTransaction: String?,
+        error: String?,
+        promise: Promise
+    ) {
+        scope.launch {
+            try {
+                // Build TLV payload for response
+                val stream = ByteArrayOutputStream()
+
+                // Transaction ID TLV (tag 0x01)
+                val txIdBytes = transactionId.toByteArray(Charsets.UTF_8)
+                stream.write(0x01)
+                stream.write((txIdBytes.size shr 8) and 0xFF)
+                stream.write(txIdBytes.size and 0xFF)
+                stream.write(txIdBytes)
+
+                // Signed transaction TLV (tag 0x02) - optional, base64 encoded
+                if (!signedTransaction.isNullOrEmpty()) {
+                    val signedTxBytes = signedTransaction.toByteArray(Charsets.UTF_8)
+                    stream.write(0x02)
+                    stream.write((signedTxBytes.size shr 8) and 0xFF)
+                    stream.write(signedTxBytes.size and 0xFF)
+                    stream.write(signedTxBytes)
+                }
+
+                // Error TLV (tag 0x03) - optional
+                if (!error.isNullOrEmpty()) {
+                    val errorBytes = error.toByteArray(Charsets.UTF_8)
+                    stream.write(0x03)
+                    stream.write((errorBytes.size shr 8) and 0xFF)
+                    stream.write(errorBytes.size and 0xFF)
+                    stream.write(errorBytes)
+                }
+
+                val payload = byteArrayOf(NoisePayloadType.TRANSACTION_RESPONSE.value) + stream.toByteArray()
+
+                // Send encrypted response
+                val encrypted = encryptPayload(payload, recipientPeerId)
+                if (encrypted != null) {
+                    val packet = createPacket(
+                        type = MessageType.NOISE_ENCRYPTED.value,
+                        payload = encrypted,
+                        recipientId = hexStringToByteArray(recipientPeerId)
+                    )
+                    broadcastPacket(packet)
+                }
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(null)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to respond to transaction: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    promise.reject("TRANSACTION_RESPONSE_ERROR", e.message)
+                }
+            }
+        }
     }
 
     @ReactMethod
@@ -656,6 +972,8 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             MessageType.NOISE_HANDSHAKE -> handleNoiseHandshake(packet, senderId)
             MessageType.NOISE_ENCRYPTED -> handleNoiseEncrypted(packet, senderId)
             MessageType.LEAVE -> handleLeave(senderId)
+            MessageType.FILE_TRANSFER -> handleFileTransfer(packet, senderId)
+            MessageType.FRAGMENT -> handleFileFragment(packet, senderId)
             else -> Log.d(TAG, "Unknown message type: ${packet.type}")
         }
 
@@ -812,6 +1130,8 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                     putString("fromPeerId", senderId)
                 })
             }
+            NoisePayloadType.SOLANA_TRANSACTION -> handleSolanaTransaction(payloadData, senderId)
+            NoisePayloadType.TRANSACTION_RESPONSE -> handleTransactionResponse(payloadData, senderId)
             else -> {}
         }
     }
@@ -857,6 +1177,240 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             putMap("message", message)
         })
     }
+
+    private fun handleSolanaTransaction(data: ByteArray, senderId: String) {
+        // Parse TLV Solana transaction
+        var txId: String? = null
+        var serializedTransaction: String? = null
+        var firstSignerPublicKey: String? = null
+        var secondSignerPublicKey: String? = null
+        var description: String? = null
+
+        var offset = 0
+        while (offset < data.size) {
+            if (offset + 3 > data.size) break
+
+            val tag = data[offset]
+            val length = ((data[offset + 1].toInt() and 0xFF) shl 8) or
+                    (data[offset + 2].toInt() and 0xFF)
+            offset += 3
+
+            if (offset + length > data.size) break
+            val value = data.copyOfRange(offset, offset + length)
+            offset += length
+
+            when (tag.toInt()) {
+                0x01 -> txId = String(value, Charsets.UTF_8)
+                0x02 -> serializedTransaction = String(value, Charsets.UTF_8)
+                0x03 -> firstSignerPublicKey = String(value, Charsets.UTF_8)
+                0x04 -> secondSignerPublicKey = String(value, Charsets.UTF_8)
+                0x05 -> description = String(value, Charsets.UTF_8)
+            }
+        }
+
+        if (txId == null || serializedTransaction == null || firstSignerPublicKey == null || secondSignerPublicKey == null) {
+            Log.e(TAG, "Invalid Solana transaction data")
+            return
+        }
+
+        val txMap = Arguments.createMap().apply {
+            putString("id", txId)
+            putString("serializedTransaction", serializedTransaction)
+            putString("senderPeerId", senderId)
+            putString("firstSignerPublicKey", firstSignerPublicKey)
+            putString("secondSignerPublicKey", secondSignerPublicKey)
+            if (description != null) putString("description", description)
+            putDouble("timestamp", System.currentTimeMillis().toDouble())
+            putBoolean("requiresSecondSigner", true)
+        }
+
+        sendEvent("onTransactionReceived", Arguments.createMap().apply {
+            putMap("transaction", txMap)
+        })
+
+        Log.d(TAG, "Received Solana transaction $txId from $senderId")
+    }
+
+    private fun handleTransactionResponse(data: ByteArray, senderId: String) {
+        // Parse TLV transaction response
+        var txId: String? = null
+        var signedTransaction: String? = null
+        var error: String? = null
+
+        var offset = 0
+        while (offset < data.size) {
+            if (offset + 3 > data.size) break
+
+            val tag = data[offset]
+            val length = ((data[offset + 1].toInt() and 0xFF) shl 8) or
+                    (data[offset + 2].toInt() and 0xFF)
+            offset += 3
+
+            if (offset + length > data.size) break
+            val value = data.copyOfRange(offset, offset + length)
+            offset += length
+
+            when (tag.toInt()) {
+                0x01 -> txId = String(value, Charsets.UTF_8)
+                0x02 -> signedTransaction = String(value, Charsets.UTF_8)
+                0x03 -> error = String(value, Charsets.UTF_8)
+            }
+        }
+
+        if (txId == null) {
+            Log.e(TAG, "Invalid transaction response")
+            return
+        }
+
+        val responseMap = Arguments.createMap().apply {
+            putString("id", txId)
+            putString("responderPeerId", senderId)
+            if (signedTransaction != null) putString("signedTransaction", signedTransaction)
+            if (error != null) putString("error", error)
+            putDouble("timestamp", System.currentTimeMillis().toDouble())
+        }
+
+        sendEvent("onTransactionResponse", Arguments.createMap().apply {
+            putMap("response", responseMap)
+        })
+
+        Log.d(TAG, "Received transaction response for $txId from $senderId")
+    }
+
+    private fun handleFileTransfer(packet: BitchatPacket, senderId: String) {
+        // Parse file transfer metadata
+        var transferId: String? = null
+        var fileName: String? = null
+        var fileSize: Int? = null
+        var mimeType: String? = null
+        var totalChunks: Int? = null
+
+        var offset = 0
+        while (offset < packet.payload.size) {
+            if (offset + 3 > packet.payload.size) break
+
+            val tag = packet.payload[offset]
+            val length = ((packet.payload[offset + 1].toInt() and 0xFF) shl 8) or
+                    (packet.payload[offset + 2].toInt() and 0xFF)
+            offset += 3
+
+            if (offset + length > packet.payload.size) break
+            val value = packet.payload.copyOfRange(offset, offset + length)
+            offset += length
+
+            when (tag.toInt()) {
+                0x01 -> transferId = String(value, Charsets.UTF_8)
+                0x02 -> fileName = String(value, Charsets.UTF_8)
+                0x03 -> fileSize = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+                0x04 -> mimeType = String(value, Charsets.UTF_8)
+                0x05 -> totalChunks = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+            }
+        }
+
+        if (transferId == null || fileName == null || fileSize == null || mimeType == null || totalChunks == null) {
+            Log.e(TAG, "Invalid file transfer metadata")
+            return
+        }
+
+        // Store transfer info
+        activeFileTransfers[transferId] = FileTransfer(
+            id = transferId,
+            fileName = fileName,
+            fileSize = fileSize,
+            mimeType = mimeType,
+            senderPeerId = senderId,
+            totalChunks = totalChunks,
+            receivedChunks = mutableSetOf()
+        )
+        fileTransferFragments[transferId] = mutableMapOf()
+
+        Log.d(TAG, "Started receiving file: $fileName ($fileSize bytes, $totalChunks chunks)")
+    }
+
+    private fun handleFileFragment(packet: BitchatPacket, senderId: String) {
+        // Parse file fragment
+        var transferId: String? = null
+        var chunkIndex: Int? = null
+        var totalChunks: Int? = null
+        var chunkData: ByteArray? = null
+
+        var offset = 0
+        while (offset < packet.payload.size) {
+            if (offset + 3 > packet.payload.size) break
+
+            val tag = packet.payload[offset]
+            val length = ((packet.payload[offset + 1].toInt() and 0xFF) shl 8) or
+                    (packet.payload[offset + 2].toInt() and 0xFF)
+            offset += 3
+
+            if (offset + length > packet.payload.size) break
+            val value = packet.payload.copyOfRange(offset, offset + length)
+            offset += length
+
+            when (tag.toInt()) {
+                0x01 -> transferId = String(value, Charsets.UTF_8)
+                0x02 -> chunkIndex = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+                0x03 -> totalChunks = value.fold(0) { acc, b -> (acc shl 8) or (b.toInt() and 0xFF) }
+                0x04 -> chunkData = value
+            }
+        }
+
+        if (transferId == null || chunkIndex == null || totalChunks == null || chunkData == null) {
+            Log.e(TAG, "Invalid file fragment")
+            return
+        }
+
+        val transfer = activeFileTransfers[transferId] ?: return
+        
+        // Store the fragment
+        fileTransferFragments[transferId]?.set(chunkIndex, chunkData)
+        transfer.receivedChunks.add(chunkIndex)
+
+        Log.d(TAG, "Received chunk $chunkIndex/$totalChunks for transfer $transferId")
+
+        // Check if we have all chunks
+        if (transfer.receivedChunks.size == transfer.totalChunks) {
+            // Reassemble file
+            val reassembledData = ByteArrayOutputStream()
+            for (i in 0 until transfer.totalChunks) {
+                fileTransferFragments[transferId]?.get(i)?.let { reassembledData.write(it) }
+            }
+
+            // Convert to base64
+            val base64Data = android.util.Base64.encodeToString(reassembledData.toByteArray(), android.util.Base64.DEFAULT)
+
+            // Emit file received event
+            val fileMap = Arguments.createMap().apply {
+                putString("id", transfer.id)
+                putString("fileName", transfer.fileName)
+                putInt("fileSize", transfer.fileSize)
+                putString("mimeType", transfer.mimeType)
+                putString("data", base64Data)
+                putString("senderPeerId", transfer.senderPeerId)
+                putDouble("timestamp", System.currentTimeMillis().toDouble())
+            }
+
+            sendEvent("onFileReceived", Arguments.createMap().apply {
+                putMap("file", fileMap)
+            })
+
+            // Clean up
+            activeFileTransfers.remove(transferId)
+            fileTransferFragments.remove(transferId)
+
+            Log.d(TAG, "File transfer complete: ${transfer.fileName}")
+        }
+    }
+
+    private data class FileTransfer(
+        val id: String,
+        val fileName: String,
+        val fileSize: Int,
+        val mimeType: String,
+        val senderPeerId: String,
+        val totalChunks: Int,
+        val receivedChunks: MutableSet<Int> = mutableSetOf()
+    )
 
     private fun handleLeave(senderId: String) {
         peers.remove(senderId)
@@ -1100,7 +1654,8 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         NOISE_ENCRYPTED(0x05),
         FILE_TRANSFER(0x06),
         FRAGMENT(0x07),
-        REQUEST_SYNC(0x08);
+        REQUEST_SYNC(0x08),
+        SOLANA_TRANSACTION(0x09);
 
         companion object {
             fun fromValue(value: Byte): MessageType? = values().find { it.value == value }
@@ -1113,7 +1668,9 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         DELIVERY_ACK(0x03),
         FILE_TRANSFER(0x04),
         VERIFY_CHALLENGE(0x05),
-        VERIFY_RESPONSE(0x06);
+        VERIFY_RESPONSE(0x06),
+        SOLANA_TRANSACTION(0x07),
+        TRANSACTION_RESPONSE(0x08);
 
         companion object {
             fun fromValue(value: Byte): NoisePayloadType? = values().find { it.value == value }

@@ -27,6 +27,10 @@ RCT_EXTERN_METHOD(sendFile:(NSString *)filePath recipientPeerId:(NSString *)reci
 
 RCT_EXTERN_METHOD(sendReadReceipt:(NSString *)messageId recipientPeerId:(NSString *)recipientPeerId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(sendTransaction:(NSString *)txId serializedTransaction:(NSString *)serializedTransaction recipientPeerId:(NSString *)recipientPeerId firstSignerPublicKey:(NSString *)firstSignerPublicKey secondSignerPublicKey:(NSString *)secondSignerPublicKey description:(NSString *)description resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+
+RCT_EXTERN_METHOD(respondToTransaction:(NSString *)transactionId recipientPeerId:(NSString *)recipientPeerId signedTransaction:(NSString *)signedTransaction error:(NSString *)error resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+
 RCT_EXTERN_METHOD(hasEncryptedSession:(NSString *)peerId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 
 RCT_EXTERN_METHOD(initiateHandshake:(NSString *)peerId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)

@@ -49,6 +49,48 @@ export interface FileTransfer {
   timestamp: number;
 }
 
+export interface SolanaTransaction {
+  id: string;
+  /** Base64-encoded serialized transaction (could be partially signed) */
+  serializedTransaction: string;
+  /** The peer ID who initiated/sent the transaction */
+  senderPeerId: string;
+  /** The public key of the first signer (sender) */
+  firstSignerPublicKey: string;
+  /** The public key of the second signer (recipient) who needs to sign */
+  secondSignerPublicKey: string;
+  /** Description or purpose of the transaction */
+  description?: string;
+  /** Timestamp when transaction was sent */
+  timestamp: number;
+  /** Whether this transaction requires the second signer to sign */
+  requiresSecondSigner: boolean;
+}
+
+export interface TransactionResponse {
+  id: string;
+  /** The peer ID who responded */
+  responderPeerId: string;
+  /** Base64-encoded fully signed transaction (after second signer signs) */
+  signedTransaction?: string;
+  /** Error message if signing failed */
+  error?: string;
+  /** Timestamp of response */
+  timestamp: number;
+}
+
+export interface SolanaNonceTransaction {
+  recentBlockhash: string;
+  nonceAccount: string;
+  nonceAuthority: string;
+  feePayer: string;
+  instructions: Array<{
+    programId: string;
+    keys: Array<{ pubkey: string; isSigner: boolean; isWritable: boolean }>;
+    data: string; // base64 encoded
+  }>;
+}
+
 export interface PermissionStatus {
   bluetooth: boolean;
   bluetoothAdvertise?: boolean; // Android 12+
@@ -68,6 +110,8 @@ export interface MeshServiceConfig {
 export type PeerListUpdatedEvent = { peers: Peer[] };
 export type MessageReceivedEvent = { message: Message };
 export type FileReceivedEvent = { file: FileTransfer };
+export type TransactionReceivedEvent = { transaction: SolanaTransaction };
+export type TransactionResponseEvent = { response: TransactionResponse };
 export type ConnectionStateChangedEvent = { state: ConnectionState; peerCount: number };
 export type PermissionsChangedEvent = { permissions: PermissionStatus };
 export type ErrorEvent = { code: string; message: string };
@@ -245,6 +289,46 @@ class BleMeshService {
     return BleMeshModule.sendFile(filePath, options?.recipientPeerId || null, options?.channel || null);
   }
 
+  // Send a Solana transaction for the recipient to sign as second signer
+  async sendTransaction(
+    serializedTransaction: string,
+    recipientPeerId: string,
+    options?: {
+      firstSignerPublicKey: string;
+      secondSignerPublicKey: string;
+      description?: string;
+    }
+  ): Promise<string> {
+    this.ensureInitialized();
+    const txId = Math.random().toString(36).substring(2, 15);
+    return BleMeshModule.sendTransaction(
+      txId,
+      serializedTransaction,
+      recipientPeerId,
+      options?.firstSignerPublicKey,
+      options?.secondSignerPublicKey,
+      options?.description || null
+    );
+  }
+
+  // Respond to a received transaction (sign or reject)
+  async respondToTransaction(
+    transactionId: string,
+    recipientPeerId: string,
+    response: {
+      signedTransaction?: string;
+      error?: string;
+    }
+  ): Promise<void> {
+    this.ensureInitialized();
+    await BleMeshModule.respondToTransaction(
+      transactionId,
+      recipientPeerId,
+      response.signedTransaction || null,
+      response.error || null
+    );
+  }
+
   // Send a read receipt for a message
   async sendReadReceipt(messageId: string, recipientPeerId: string): Promise<void> {
     this.ensureInitialized();
@@ -261,6 +345,14 @@ class BleMeshService {
   async initiateHandshake(peerId: string): Promise<void> {
     this.ensureInitialized();
     await BleMeshModule.initiateHandshake(peerId);
+  }
+
+  async sendSolanaNonceTransaction(
+    transaction: SolanaNonceTransaction,
+    recipientPeerId: string
+  ): Promise<string> {
+    this.ensureInitialized();
+    return BleMeshModule.sendSolanaNonceTransaction(transaction, recipientPeerId);
   }
 
   // Get the identity fingerprint for verification
@@ -294,6 +386,16 @@ class BleMeshService {
 
   onFileReceived(callback: EventCallback<FileReceivedEvent>): () => void {
     const subscription = eventEmitter.addListener('onFileReceived', callback);
+    return () => subscription.remove();
+  }
+
+  onTransactionReceived(callback: EventCallback<TransactionReceivedEvent>): () => void {
+    const subscription = eventEmitter.addListener('onTransactionReceived', callback);
+    return () => subscription.remove();
+  }
+
+  onTransactionResponse(callback: EventCallback<TransactionResponseEvent>): () => void {
+    const subscription = eventEmitter.addListener('onTransactionResponse', callback);
     return () => subscription.remove();
   }
 
