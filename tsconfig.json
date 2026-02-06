@@ -2,7 +2,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "kard-network-ble-mesh": ["./src/index"]
+      "ble-mesh": ["./src/index"]
     },
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
@@ -22,5 +22,6 @@
     "skipLibCheck": true,
     "strict": true,
     "target": "ESNext"
-  }
+  },
+  "exclude": ["node_modules", "lib", "example"]
 }

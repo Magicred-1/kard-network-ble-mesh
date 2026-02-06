@@ -8,7 +8,7 @@ import {
   StyleSheet,
   Alert,
 } from 'react-native';
-import { BleMesh, Peer, Message } from 'kard-network-ble-mesh';
+import { BleMesh, Peer, Message } from '@magicred-1/ble-mesh';
 
 export default function App() {
   const [isConnected, setIsConnected] = useState(false);

@@ -458,9 +458,9 @@ class BleMesh: RCTEventEmitter {
     func sendTransaction(
         _ txId: String,
         serializedTransaction: String,
-        recipientPeerId: String,
+        recipientPeerId: String?,
         firstSignerPublicKey: String,
-        secondSignerPublicKey: String,
+        secondSignerPublicKey: String?,
         description: String?,
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
@@ -480,33 +480,49 @@ class BleMesh: RCTEventEmitter {
             // Check if we need chunking (MTU limit is ~500 bytes for encrypted payload)
             let maxPayloadSize = 450 // Conservative limit
             
-            // Send as encrypted message to recipient
-            if self.sessions[recipientPeerId] != nil {
-                var encryptedPayload = Data([NoisePayloadType.solanaTransaction.rawValue])
-                encryptedPayload.append(payload)
-                
-                if let encrypted = self.encryptPayload(encryptedPayload, for: recipientPeerId) {
-                    if encrypted.count <= maxPayloadSize {
-                        // Small enough for single packet
-                        let packet = self.createPacket(
-                            type: MessageType.noiseEncrypted.rawValue,
-                            payload: encrypted,
-                            recipientID: Data(hexString: recipientPeerId)
-                        )
-                        self.broadcastPacket(packet)
-                    } else {
-                        // Need to chunk large transaction
-                        print("Transaction too large (\(encrypted.count) bytes), using chunking")
-                        self.sendChunkedTransaction(txId: txId, encryptedData: encrypted, recipientPeerId: recipientPeerId)
-                    }
-                }
+            if let targetPeerId = recipientPeerId {
+                // Send to specific peer
+                self.sendTransactionToPeer(txId: txId, payload: payload, recipientPeerId: targetPeerId, maxPayloadSize: maxPayloadSize)
             } else {
-                // No session, initiate handshake first
-                self.initiateHandshakeInternal(with: recipientPeerId)
+                // Broadcast to all connected peers with sessions
+                print("Broadcasting transaction \(txId) to all peers")
+                var sentCount = 0
+                for peerId in self.sessions.keys {
+                    self.sendTransactionToPeer(txId: txId, payload: payload, recipientPeerId: peerId, maxPayloadSize: maxPayloadSize)
+                    sentCount += 1
+                }
+                print("Transaction broadcast to \(sentCount) peers")
             }
             
             DispatchQueue.main.async {
                 resolve(txId)
+            }
+        }
+    }
+    
+    private func sendTransactionToPeer(txId: String, payload: Data, recipientPeerId: String, maxPayloadSize: Int) {
+        guard self.sessions[recipientPeerId] != nil else {
+            // No session, initiate handshake first
+            self.initiateHandshakeInternal(with: recipientPeerId)
+            return
+        }
+        
+        var encryptedPayload = Data([NoisePayloadType.solanaTransaction.rawValue])
+        encryptedPayload.append(payload)
+        
+        if let encrypted = self.encryptPayload(encryptedPayload, for: recipientPeerId) {
+            if encrypted.count <= maxPayloadSize {
+                // Small enough for single packet
+                let packet = self.createPacket(
+                    type: MessageType.noiseEncrypted.rawValue,
+                    payload: encrypted,
+                    recipientID: Data(hexString: recipientPeerId)
+                )
+                self.broadcastPacket(packet)
+            } else {
+                // Need to chunk large transaction
+                print("Transaction too large (\(encrypted.count) bytes), using chunking")
+                self.sendChunkedTransaction(txId: txId, encryptedData: encrypted, recipientPeerId: recipientPeerId)
             }
         }
     }
@@ -605,7 +621,7 @@ class BleMesh: RCTEventEmitter {
         txId: String,
         serializedTransaction: String,
         firstSignerPublicKey: String,
-        secondSignerPublicKey: String,
+        secondSignerPublicKey: String?,
         description: String?
     ) -> Data {
         var payload = Data()
@@ -628,11 +644,13 @@ class BleMesh: RCTEventEmitter {
         payload.append(contentsOf: withUnsafeBytes(of: UInt16(firstSignerData.count).bigEndian) { Array($0) })
         payload.append(firstSignerData)
         
-        // Second signer public key TLV (tag 0x04)
-        let secondSignerData = Data(secondSignerPublicKey.utf8)
-        payload.append(0x04)
-        payload.append(contentsOf: withUnsafeBytes(of: UInt16(secondSignerData.count).bigEndian) { Array($0) })
-        payload.append(secondSignerData)
+        // Second signer public key TLV (tag 0x04) - optional
+        if let secondSigner = secondSignerPublicKey, !secondSigner.isEmpty {
+            let secondSignerData = Data(secondSigner.utf8)
+            payload.append(0x04)
+            payload.append(contentsOf: withUnsafeBytes(of: UInt16(secondSignerData.count).bigEndian) { Array($0) })
+            payload.append(secondSignerData)
+        }
         
         // Description TLV (tag 0x05) - optional
         if let desc = description, !desc.isEmpty {
@@ -1118,7 +1136,7 @@ class BleMesh: RCTEventEmitter {
             }
         }
         
-        guard let id = txId, let tx = serializedTransaction, let firstSigner = firstSignerPublicKey, let secondSigner = secondSignerPublicKey else {
+        guard let id = txId, let tx = serializedTransaction, let firstSigner = firstSignerPublicKey else {
             print("Invalid Solana transaction data")
             return
         }
@@ -1128,17 +1146,22 @@ class BleMesh: RCTEventEmitter {
             "serializedTransaction": tx,
             "senderPeerId": senderID,
             "firstSignerPublicKey": firstSigner,
-            "secondSignerPublicKey": secondSigner,
             "timestamp": Int(Date().timeIntervalSince1970 * 1000),
-            "requiresSecondSigner": true
+            "requiresSecondSigner": true,
+            "openForAnySigner": secondSignerPublicKey == nil
         ]
+        
+        // Second signer is optional - any peer can sign
+        if let secondSigner = secondSignerPublicKey {
+            txDict["secondSignerPublicKey"] = secondSigner
+        }
         
         if let desc = description {
             txDict["description"] = desc
         }
         
         sendEvent(withName: "onTransactionReceived", body: ["transaction": txDict])
-        print("Received Solana transaction \(id) from \(senderID)")
+        print("Received Solana transaction \(id) from \(senderID) (openForAnySigner=\(secondSignerPublicKey == nil))")
     }
     
     private func handleTransactionResponse(_ data: Data, from senderID: String) {

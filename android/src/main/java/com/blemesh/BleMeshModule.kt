@@ -30,6 +30,7 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         private const val SERVICE_UUID_RELEASE = "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C"
         private const val CHARACTERISTIC_UUID = "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D"
         private const val MESSAGE_TTL: Byte = 7
+        private const val FILE_FRAGMENT_SIZE = 180 // Max payload size for fragments
     }
 
     private val serviceUUID = UUID.fromString(if (BuildConfig.DEBUG) SERVICE_UUID_DEBUG else SERVICE_UUID_RELEASE)
@@ -75,7 +76,6 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     // File transfer tracking
     private val activeFileTransfers = mutableMapOf<String, FileTransfer>()
     private val fileTransferFragments = mutableMapOf<String, MutableMap<Int, ByteArray>>()
-    private const val FILE_FRAGMENT_SIZE = 180 // Max payload size for fragments
 
     // Transaction chunking tracking
     private val pendingTransactionChunks = mutableMapOf<String, TransactionChunks>()
@@ -457,9 +457,9 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
     fun sendTransaction(
         txId: String,
         serializedTransaction: String,
-        recipientPeerId: String,
+        recipientPeerId: String?,
         firstSignerPublicKey: String,
-        secondSignerPublicKey: String,
+        secondSignerPublicKey: String?,
         description: String?,
         promise: Promise
     ) {
@@ -477,28 +477,23 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                 // Check if we need chunking (MTU limit is ~500 bytes for encrypted payload)
                 val maxPayloadSize = 450 // Conservative limit for encrypted data
                 
-                if (sessions.containsKey(recipientPeerId)) {
-                    val encryptedPayload = byteArrayOf(NoisePayloadType.SOLANA_TRANSACTION.value) + payload
-                    val encrypted = encryptPayload(encryptedPayload, recipientPeerId)
-                    
-                    if (encrypted != null) {
-                        if (encrypted.size <= maxPayloadSize) {
-                            // Small enough for single packet
-                            val packet = createPacket(
-                                type = MessageType.NOISE_ENCRYPTED.value,
-                                payload = encrypted,
-                                recipientId = hexStringToByteArray(recipientPeerId)
-                            )
-                            broadcastPacket(packet)
-                        } else {
-                            // Need to chunk large transaction
-                            Log.d(TAG, "Transaction too large (${encrypted.size} bytes), using chunking")
-                            sendChunkedTransaction(txId, encrypted, recipientPeerId)
-                        }
+                if (recipientPeerId != null) {
+                    // Send to specific peer
+                    if (sessions.containsKey(recipientPeerId)) {
+                        sendTransactionToPeer(txId, payload, recipientPeerId, maxPayloadSize)
+                    } else {
+                        // No session, initiate handshake first
+                        initiateHandshakeInternal(recipientPeerId)
                     }
                 } else {
-                    // No session, initiate handshake first
-                    initiateHandshakeInternal(recipientPeerId)
+                    // Broadcast to all connected peers with sessions
+                    Log.d(TAG, "Broadcasting transaction $txId to all peers")
+                    var sentCount = 0
+                    sessions.keys.forEach { peerId ->
+                        sendTransactionToPeer(txId, payload, peerId, maxPayloadSize)
+                        sentCount++
+                    }
+                    Log.d(TAG, "Transaction broadcast to $sentCount peers")
                 }
 
                 withContext(Dispatchers.Main) {
@@ -509,6 +504,27 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
                 withContext(Dispatchers.Main) {
                     promise.reject("TRANSACTION_ERROR", e.message)
                 }
+            }
+        }
+    }
+    
+    private suspend fun sendTransactionToPeer(txId: String, payload: ByteArray, recipientPeerId: String, maxPayloadSize: Int) {
+        val encryptedPayload = byteArrayOf(NoisePayloadType.SOLANA_TRANSACTION.value) + payload
+        val encrypted = encryptPayload(encryptedPayload, recipientPeerId)
+        
+        if (encrypted != null) {
+            if (encrypted.size <= maxPayloadSize) {
+                // Small enough for single packet
+                val packet = createPacket(
+                    type = MessageType.NOISE_ENCRYPTED.value,
+                    payload = encrypted,
+                    recipientId = hexStringToByteArray(recipientPeerId)
+                )
+                broadcastPacket(packet)
+            } else {
+                // Need to chunk large transaction
+                Log.d(TAG, "Transaction too large (${encrypted.size} bytes), using chunking")
+                sendChunkedTransaction(txId, encrypted, recipientPeerId)
             }
         }
     }
@@ -621,7 +637,7 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         txId: String,
         serializedTransaction: String,
         firstSignerPublicKey: String,
-        secondSignerPublicKey: String,
+        secondSignerPublicKey: String?,
         description: String?
     ): ByteArray {
         val stream = ByteArrayOutputStream()
@@ -647,12 +663,14 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
         stream.write(firstSignerBytes.size and 0xFF)
         stream.write(firstSignerBytes)
 
-        // Second signer public key TLV (tag 0x04)
-        val secondSignerBytes = secondSignerPublicKey.toByteArray(Charsets.UTF_8)
-        stream.write(0x04)
-        stream.write((secondSignerBytes.size shr 8) and 0xFF)
-        stream.write(secondSignerBytes.size and 0xFF)
-        stream.write(secondSignerBytes)
+        // Second signer public key TLV (tag 0x04) - optional
+        if (!secondSignerPublicKey.isNullOrEmpty()) {
+            val secondSignerBytes = secondSignerPublicKey.toByteArray(Charsets.UTF_8)
+            stream.write(0x04)
+            stream.write((secondSignerBytes.size shr 8) and 0xFF)
+            stream.write(secondSignerBytes.size and 0xFF)
+            stream.write(secondSignerBytes)
+        }
 
         // Description TLV (tag 0x05) - optional
         if (!description.isNullOrEmpty()) {
@@ -1333,7 +1351,7 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             }
         }
 
-        if (txId == null || serializedTransaction == null || firstSignerPublicKey == null || secondSignerPublicKey == null) {
+        if (txId == null || serializedTransaction == null || firstSignerPublicKey == null) {
             Log.e(TAG, "Invalid Solana transaction data")
             return
         }
@@ -1343,17 +1361,19 @@ class BleMeshModule(reactContext: ReactApplicationContext) : ReactContextBaseJav
             putString("serializedTransaction", serializedTransaction)
             putString("senderPeerId", senderId)
             putString("firstSignerPublicKey", firstSignerPublicKey)
-            putString("secondSignerPublicKey", secondSignerPublicKey)
+            // Second signer is optional - any peer can sign
+            if (secondSignerPublicKey != null) putString("secondSignerPublicKey", secondSignerPublicKey)
             if (description != null) putString("description", description)
             putDouble("timestamp", System.currentTimeMillis().toDouble())
             putBoolean("requiresSecondSigner", true)
+            putBoolean("openForAnySigner", secondSignerPublicKey == null)
         }
 
         sendEvent("onTransactionReceived", Arguments.createMap().apply {
             putMap("transaction", txMap)
         })
 
-        Log.d(TAG, "Received Solana transaction $txId from $senderId")
+        Log.d(TAG, "Received Solana transaction $txId from $senderId (openForAnySigner=${secondSignerPublicKey == null})")
     }
 
     private fun handleTransactionResponse(data: ByteArray, senderId: String) {

@@ -1,4 +1,4 @@
-# kard-network-ble-mesh
+# ble-mesh
 
 A React Native library for BLE (Bluetooth Low Energy) mesh networking. Build decentralized, peer-to-peer messaging apps that work without internet connectivity.
 
@@ -16,9 +16,9 @@ A React Native library for BLE (Bluetooth Low Energy) mesh networking. Build dec
 ## Installation
 
 ```bash
-npm install kard-network-ble-mesh
+npm install ble-mesh
 # or
-yarn add kard-network-ble-mesh
+yarn add ble-mesh
 ```
 
 ### iOS
@@ -58,7 +58,7 @@ Add the following permissions to your `AndroidManifest.xml` (they are already in
 ## Usage
 
 ```typescript
-import { BleMesh } from 'kard-network-ble-mesh';
+import { BleMesh } from 'ble-mesh';
 
 // Start the mesh service (automatically requests permissions)
 await BleMesh.start({ nickname: 'Alice' });
@@ -159,21 +159,29 @@ await BleMesh.sendFile('/path/to/photo.jpg');
 await BleMesh.sendFile('/path/to/document.pdf', { recipientPeerId: 'abc123' });
 ```
 
-##### `sendTransaction(serializedTransaction: string, recipientPeerId: string, options): Promise<string>`
+##### `sendTransaction(serializedTransaction: string, options): Promise<string>`
 
-Sends a Solana transaction for the recipient to sign as the second signer. Perfect for multi-signature transactions.
+Sends a Solana transaction for any peer to sign as the second signer. Perfect for multi-signature transactions.
 
+**Targeted (specific peer):**
 ```typescript
-// Send a partially signed transaction
-await BleMesh.sendTransaction(
-  base64SerializedTx,  // Transaction signed by first signer
-  recipientPeerId,
-  {
-    firstSignerPublicKey: senderPubKey,
-    secondSignerPublicKey: recipientPubKey,
-    description: 'Payment for services'
-  }
-);
+await BleMesh.sendTransaction(base64SerializedTx, {
+  recipientPeerId: 'abc123',  // Send to specific peer (optional)
+  firstSignerPublicKey: senderPubKey,
+  secondSignerPublicKey: recipientPubKey,  // Preferred signer (optional)
+  description: 'Payment for services'
+});
+```
+
+**Broadcast (any peer can sign):**
+```typescript
+// Broadcast to all peers - any peer can sign
+await BleMesh.sendTransaction(base64SerializedTx, {
+  firstSignerPublicKey: senderPubKey,
+  // No recipientPeerId - broadcasts to all
+  // No secondSignerPublicKey - open for any signer
+  description: 'Open offer - anyone can complete'
+});
 ```
 
 ##### `respondToTransaction(transactionId: string, recipientPeerId: string, response): Promise<void>`
@@ -268,7 +276,14 @@ BleMesh.onTransactionReceived(({ transaction }) => {
   console.log('Transaction to sign:', transaction.id);
   console.log('Serialized:', transaction.serializedTransaction);
   console.log('First signer:', transaction.firstSignerPublicKey);
-  console.log('Second signer (you):', transaction.secondSignerPublicKey);
+  
+  // Check if a specific second signer is required
+  if (transaction.secondSignerPublicKey) {
+    console.log('Required second signer:', transaction.secondSignerPublicKey);
+    // Verify this is your public key before signing
+  } else if (transaction.openForAnySigner) {
+    console.log('Any peer can sign this transaction');
+  }
   
   // Sign with your wallet...
   const signedTx = await yourWallet.signTransaction(transaction.serializedTransaction);
@@ -301,7 +316,7 @@ Called when an error occurs.
 
 ## Solana Multi-Signature Transaction Flow
 
-For 2-of-2 multi-signature transactions over BLE:
+### Targeted Transaction (Specific Peer)
 
 ```
 Alice (First Signer)                    Bob (Second Signer)
@@ -309,24 +324,44 @@ Alice (First Signer)                    Bob (Second Signer)
      | 1. Create transaction                  |
      | 2. Sign with Alice's key               |
      | 3. Send via BleMesh.sendTransaction()  |
+     |    with recipientPeerId                |
      |--------------------------------------->|
      |                                        |
      |     4. onTransactionReceived event     |
      |<---------------------------------------|
      |                                        |
-     |     5. Review transaction              |
-     |     6. Sign with Bob's key             |
+     |     5. Review & sign with Bob's key    |
      |<---------------------------------------|
      |                                        |
-     | 7. respondToTransaction() with signed  |
+     | 6. respondToTransaction()              |
      |--------------------------------------->|
      |                                        |
-     |     8. onTransactionResponse event     |
-     |<---------------------------------------|
-     |                                        |
-     | 9. Broadcast fully signed tx           |
-     |    to Solana network                   |
-     v                                        v
+     | 7. Broadcast fully signed tx           |
+     v   to Solana network                    v
+```
+
+### Broadcast Transaction (Any Peer Can Sign)
+
+```
+Alice (First Signer)         Bob          Carol         Dave
+     |                       |             |             |
+     | 1. Create tx          |             |             |
+     | 2. Sign               |             |             |
+     | 3. Broadcast          |             |             |
+     |---------------------->|------------>|------------>|
+     |                       |             |             |
+     |                       | 4. All receive            |
+     |                       |    onTransactionReceived  |
+     |                       |             |             |
+     |                       | 5. Carol decides to sign  |
+     |                       |             |             |
+     |                       |<------------|------------>|
+     |                       | 6. Carol responds         |
+     |<----------------------|-------------|-------------|
+     |                       |             |             |
+     | 7. Alice receives     |             |             |
+     |    signed tx          |             |             |
+     v                       v             v             v
 ```
 
 ### MTU and Transaction Size Limits

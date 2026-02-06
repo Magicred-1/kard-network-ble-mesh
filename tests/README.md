@@ -1,6 +1,6 @@
 # BleMesh Test Suite
 
-This folder contains the test suite for the kard-network-ble-mesh library.
+This folder contains the test suite for the ble-mesh library.
 
 ## Test Structure
 

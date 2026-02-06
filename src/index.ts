@@ -1,7 +1,7 @@
 import { NativeModules, NativeEventEmitter, Platform, PermissionsAndroid, Permission } from 'react-native';
 
 const LINKING_ERROR =
-  `The package 'kard-network-ble-mesh' doesn't seem to be linked. Make sure: \n\n` +
+  `The package 'ble-mesh' doesn't seem to be linked. Make sure: \n\n` +
   Platform.select({ ios: "- You have run 'pod install'\n", default: '' }) +
   '- You rebuilt the app after installing the package\n' +
   '- You are not using Expo Go (this package requires a development build)\n';
@@ -57,13 +57,16 @@ export interface SolanaTransaction {
   senderPeerId: string;
   /** The public key of the first signer (sender) */
   firstSignerPublicKey: string;
-  /** The public key of the second signer (recipient) who needs to sign */
-  secondSignerPublicKey: string;
+  /** 
+   * The preferred public key of the second signer (optional).
+   * If not provided, any peer can sign as the second signer.
+   */
+  secondSignerPublicKey?: string;
   /** Description or purpose of the transaction */
   description?: string;
   /** Timestamp when transaction was sent */
   timestamp: number;
-  /** Whether this transaction requires the second signer to sign */
+  /** Whether this transaction requires a second signer to sign */
   requiresSecondSigner: boolean;
 }
 
@@ -289,14 +292,23 @@ class BleMeshService {
     return BleMeshModule.sendFile(filePath, options?.recipientPeerId || null, options?.channel || null);
   }
 
-  // Send a Solana transaction for the recipient to sign as second signer
+  /**
+   * Send a Solana transaction for any peer to sign as second signer.
+   * 
+   * @param serializedTransaction - Base64-encoded partially signed transaction
+   * @param options - Transaction options
+   * @param options.firstSignerPublicKey - Public key of the first signer (required)
+   * @param options.secondSignerPublicKey - Preferred second signer (optional, any peer can sign if not specified)
+   * @param options.description - Description of the transaction
+   * @param options.recipientPeerId - Specific peer to send to (optional, broadcasts to all if not specified)
+   */
   async sendTransaction(
     serializedTransaction: string,
-    recipientPeerId: string,
     options?: {
       firstSignerPublicKey: string;
-      secondSignerPublicKey: string;
+      secondSignerPublicKey?: string;
       description?: string;
+      recipientPeerId?: string;
     }
   ): Promise<string> {
     this.ensureInitialized();
@@ -304,9 +316,9 @@ class BleMeshService {
     return BleMeshModule.sendTransaction(
       txId,
       serializedTransaction,
-      recipientPeerId,
+      options?.recipientPeerId || null,
       options?.firstSignerPublicKey,
-      options?.secondSignerPublicKey,
+      options?.secondSignerPublicKey || null,
       options?.description || null
     );
   }

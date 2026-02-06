@@ -153,37 +153,55 @@ describe('BleMeshService', () => {
       await bleMesh.start();
     });
 
-    it('should send a Solana transaction', async () => {
+    it('should send a Solana transaction to specific peer', async () => {
       const serializedTx = 'base64EncodedTransactionData';
-      const recipientPeerId = 'peer-abc';
       const options = {
+        recipientPeerId: 'peer-abc',
         firstSignerPublicKey: 'senderPubKey11111111111111111111111111111111',
         secondSignerPublicKey: 'recipientPubKey2222222222222222222222222222',
         description: 'Payment for services',
       };
 
-      const txId = await bleMesh.sendTransaction(serializedTx, recipientPeerId, options);
+      const txId = await bleMesh.sendTransaction(serializedTx, options);
 
       expect(txId).toBe('tx-id-123');
       expect(mockBleMeshModule.sendTransaction).toHaveBeenCalled();
       const callArgs = mockBleMeshModule.sendTransaction.mock.calls[0];
       expect(callArgs[0]).toMatch(/^[a-z0-9]+$/); // txId is auto-generated
       expect(callArgs[1]).toBe(serializedTx);
-      expect(callArgs[2]).toBe(recipientPeerId);
+      expect(callArgs[2]).toBe(options.recipientPeerId);
       expect(callArgs[3]).toBe(options.firstSignerPublicKey);
       expect(callArgs[4]).toBe(options.secondSignerPublicKey);
       expect(callArgs[5]).toBe(options.description);
     });
 
+    it('should broadcast a Solana transaction to all peers', async () => {
+      const serializedTx = 'base64EncodedTransactionData';
+      const options = {
+        firstSignerPublicKey: 'senderPubKey11111111111111111111111111111111',
+        // No recipientPeerId - should broadcast to all
+        // No secondSignerPublicKey - any peer can sign
+        description: 'Open for any signer',
+      };
+
+      const txId = await bleMesh.sendTransaction(serializedTx, options);
+
+      expect(txId).toBe('tx-id-123');
+      expect(mockBleMeshModule.sendTransaction).toHaveBeenCalled();
+      const callArgs = mockBleMeshModule.sendTransaction.mock.calls[0];
+      expect(callArgs[2]).toBeNull(); // recipientPeerId is null (broadcast)
+      expect(callArgs[4]).toBeNull(); // secondSignerPublicKey is null (any can sign)
+    });
+
     it('should send a Solana transaction without description', async () => {
       const serializedTx = 'base64EncodedTransactionData';
-      const recipientPeerId = 'peer-abc';
       const options = {
+        recipientPeerId: 'peer-abc',
         firstSignerPublicKey: 'senderPubKey11111111111111111111111111111111',
         secondSignerPublicKey: 'recipientPubKey2222222222222222222222222222',
       };
 
-      const txId = await bleMesh.sendTransaction(serializedTx, recipientPeerId, options);
+      const txId = await bleMesh.sendTransaction(serializedTx, options);
 
       expect(txId).toBe('tx-id-123');
       expect(mockBleMeshModule.sendTransaction).toHaveBeenCalled();
@@ -230,7 +248,8 @@ describe('BleMeshService', () => {
       // Don't call start()
       
       await expect(
-        newBleMesh.sendTransaction('tx', 'peer', {
+        newBleMesh.sendTransaction('tx', {
+          recipientPeerId: 'peer',
           firstSignerPublicKey: 'key1',
           secondSignerPublicKey: 'key2',
         })

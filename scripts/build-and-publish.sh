@@ -8,7 +8,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}🚀 Building and publishing kard-network-ble-mesh${NC}"
+echo -e "${GREEN}🚀 Building and publishing ble-mesh${NC}"
 
 # Load environment variables
 if [ -f .env ]; then
@@ -69,5 +69,5 @@ npm publish --access public
 echo -e "${YELLOW}🧹 Cleaning up...${NC}"
 rm -f .npmrc
 
-echo -e "${GREEN}✅ Successfully published kard-network-ble-mesh!${NC}"
-echo -e "${GREEN}📦 Install with: npm install kard-network-ble-mesh${NC}"
+echo -e "${GREEN}✅ Successfully published ble-mesh!${NC}"
+echo -e "${GREEN}📦 Install with: npm install ble-mesh${NC}"

@@ -11,7 +11,8 @@ const mockBleMeshModule = {
   sendMessage: jest.fn(() => Promise.resolve('msg-id-123')),
   sendPrivateMessage: jest.fn(() => Promise.resolve('private-msg-id-123')),
   sendFile: jest.fn(() => Promise.resolve('file-transfer-id')),
-  sendTransaction: jest.fn(() => Promise.resolve('tx-id-123')),
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  sendTransaction: jest.fn((_txId: string, _serializedTx: string, _recipientPeerId: string | null, _firstSignerPublicKey: string, _secondSignerPublicKey: string | null, _description: string | null) => Promise.resolve('tx-id-123')),
   respondToTransaction: jest.fn(() => Promise.resolve()),
   sendReadReceipt: jest.fn(() => Promise.resolve()),
   hasEncryptedSession: jest.fn(() => Promise.resolve(false)),

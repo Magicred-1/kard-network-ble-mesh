@@ -195,14 +195,15 @@ describe('Solana Transaction Flow', () => {
         requiresSecondSigner: true,
       };
 
-      // Verify both public keys are valid base58 (Solana addresses are base58)
+      // Verify first signer public key is valid base58
       const isValidBase58 = (str: string) => /^[A-HJ-NP-Za-km-z1-9]+$/.test(str);
-      
       expect(isValidBase58(transaction.firstSignerPublicKey)).toBe(true);
-      expect(isValidBase58(transaction.secondSignerPublicKey)).toBe(true);
       
-      // Verify keys are different
-      expect(transaction.firstSignerPublicKey).not.toBe(transaction.secondSignerPublicKey);
+      // Second signer is optional - verify if present
+      if (transaction.secondSignerPublicKey) {
+        expect(isValidBase58(transaction.secondSignerPublicKey)).toBe(true);
+        expect(transaction.firstSignerPublicKey).not.toBe(transaction.secondSignerPublicKey);
+      }
     });
   });
 
